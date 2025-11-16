@@ -1,0 +1,28 @@
+[package]
+name = "goalkeeper"
+authors = [ "Finn Bear" ]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "DoS and DDoS mitigation utilities"
+repository = "https://github.com/finnbear/goalkeeper"
+exclude = ["fuzz/"]
+
+[dependencies]
+rand = "0.9.2"
+log = "0.4.17"
+fxhash = "0.2.1"
+socket2 = { version = "0.6.1", optional = true }
+axum = { version = "0.8.1", default-features = false, optional = true }
+axum-server = { version = "0.7.1", optional = true }
+tokio = { version = "1.39.3", default-features = false, optional = true }
+tower = { version = "0.4", optional = true }
+pin-project = { version = "1.1", optional = true }
+
+[features]
+default = []
+tokio = ["dep:tokio", "socket2"]
+axum = ["dep:axum", "axum-server", "tokio", "tower", "pin-project"]
+
+[package.metadata.docs.rs]
+all-features = true
