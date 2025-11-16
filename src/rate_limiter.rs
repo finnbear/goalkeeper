@@ -46,23 +46,22 @@ pub struct RateLimiterProps {
 }
 
 impl RateLimiterState {
-    /// Returns true if the action exceeds the rate limit defined by the props and should be prevented.
+    /// Returns `true` if the action exceeds the rate limit defined by the props and should be prevented.
     pub fn should_limit_rate(&mut self, props: &RateLimiterProps) -> bool {
         self.should_limit_rate_with_now_and_usage(props, Instant::now(), 1)
     }
 
-    /// Returns true if the action exceeds the rate limit defined by the props and should be prevented.
-    #[allow(unused)]
+    /// Returns `true` if the `usage` actions exceed the rate limit defined by the props and should be prevented.
     pub fn should_limit_rate_with_usage(&mut self, props: &RateLimiterProps, usage: Units) -> bool {
         self.should_limit_rate_with_now_and_usage(props, Instant::now(), usage)
     }
 
-    /// Returns true if the action exceeds the rate limit defined by the props and should be prevented.
+    /// Like [`Self::should_limit_rate`] but more efficient if you already know the current time.
     pub fn should_limit_rate_with_now(&mut self, props: &RateLimiterProps, now: Instant) -> bool {
         self.should_limit_rate_with_now_and_usage(props, now, 1)
     }
 
-    /// Like [`Self::should_limit_rate`] but more efficient if you already know the current time.
+    /// Like [`Self::should_limit_rate_with_usage`] but more efficient if you already know the current time.
     pub fn should_limit_rate_with_now_and_usage(
         &mut self,
         props: &RateLimiterProps,
