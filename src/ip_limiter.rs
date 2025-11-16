@@ -5,11 +5,10 @@ use fxhash::FxHashMap;
 use log::warn;
 use rand::random;
 use std::net::IpAddr;
-use std::sync::{LazyLock, Mutex};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-static SINGLETON: LazyLock<Mutex<IpLimiter>> =
-    LazyLock::new(|| Mutex::new(IpLimiter::new(500000, 0)));
+static SINGLETON: Mutex<Option<IpLimiter>> = Mutex::new(None);
 
 /// Limits connections and bandwidth based on client IP addresses.
 #[derive(Debug)]
@@ -46,20 +45,27 @@ impl IpStats {
 }
 
 impl IpLimiter {
+    fn with_singleton<R>(f: impl FnOnce(&mut Self) -> R) -> R {
+        let mut opt = SINGLETON.lock().unwrap();
+        let this = opt.get_or_insert_with(|| Self::new(500000, 0));
+        // Yikes..
+        f(this)
+    }
+
     /// Visit the [IpStats] for each tracked IP.
     ///
     /// The `visitor` should never block.
     pub fn stats(mut visitor: impl FnMut(IpAddr, IpStats)) {
-        let this = SINGLETON.lock().unwrap();
-        for (ip, v) in &this.usage {
-            visitor(*ip, v.stats);
-        }
+        Self::with_singleton(|this| {
+            for (ip, v) in &this.usage {
+                visitor(*ip, v.stats);
+            }
+        });
     }
 
     /// Total number of outstanding [ConnectionPermit]s.
     pub fn total_connections() -> u32 {
-        let this = SINGLETON.lock().unwrap();
-        this.total_connection_permits
+        Self::with_singleton(|this| this.total_connection_permits)
     }
 
     /// Set the bandwidth limits for the [IpLimiter] singleton.
@@ -68,8 +74,9 @@ impl IpLimiter {
     ///
     /// Default: 500,000 bytes per second, 0 bytes burst.
     pub fn set_bandwidth_limits(bytes_per_second: Units, bytes_burst: Units) {
-        let mut this = SINGLETON.lock().unwrap();
-        this.props = RateLimiterProps::new_throughput(bytes_per_second, bytes_burst);
+        Self::with_singleton(|this| {
+            this.props = RateLimiterProps::new_throughput(bytes_per_second, bytes_burst);
+        })
     }
 
     /// Set the 90th percentile number of [ConnectionPermit]s required per
@@ -82,8 +89,9 @@ impl IpLimiter {
     ///
     /// Default: 1 (i.e. typical HTTP/2 clients)
     pub fn set_connections_per_active_p90(connections_per_active_p90: u32) {
-        let mut this = SINGLETON.lock().unwrap();
-        this.connections_per_active_p90 = connections_per_active_p90;
+        Self::with_singleton(|this| {
+            this.connections_per_active_p90 = connections_per_active_p90;
+        })
     }
 
     /// Set the 99th+ percentile number of [ConnectionPermit]s required per
@@ -93,8 +101,9 @@ impl IpLimiter {
     ///
     /// Default: 6
     pub fn set_connections_per_active_p99(connections_per_active_p99: u32) {
-        let mut this = SINGLETON.lock().unwrap();
-        this.connections_per_active_p99 = connections_per_active_p99;
+        Self::with_singleton(|this| {
+            this.connections_per_active_p99 = connections_per_active_p99;
+        })
     }
 
     /// Set the soft maximum number of [ConnectionPermit]s, across all IP's,
@@ -102,8 +111,9 @@ impl IpLimiter {
     ///
     /// Default: 300
     pub fn set_total_connections_soft_limit(total_connections_soft_limit: u32) {
-        let mut this = SINGLETON.lock().unwrap();
-        this.total_connections_soft_limit = total_connections_soft_limit;
+        Self::with_singleton(|this| {
+            this.total_connections_soft_limit = total_connections_soft_limit;
+        })
     }
 
     /// Set the hard limit on the number of [ConnectionPermit]s, across all IP's,
@@ -111,16 +121,16 @@ impl IpLimiter {
     ///
     /// Default 1000.
     pub fn set_total_connections_hard_limit(total_connections_hard_limit: u32) {
-        let mut this = SINGLETON.lock().unwrap();
-        this.total_connections_hard_limit = total_connections_hard_limit;
+        Self::with_singleton(|this| {
+            this.total_connections_hard_limit = total_connections_hard_limit;
+        })
     }
 
     /// Call when processing a message of `bytes` bytes from `ip` at `now`.
     ///
     /// If this returns `true`, block the `usage` of bandwidth.
     pub fn should_limit_bandwidth(ip: IpAddr, bytes: Units, label: &str, now: Instant) -> bool {
-        let mut this = SINGLETON.lock().unwrap();
-        this.should_limit_bandwidth_inner(ip, bytes, label, now)
+        Self::with_singleton(|this| this.should_limit_bandwidth_inner(ip, bytes, label, now))
     }
 
     pub(crate) fn should_limit_bandwidth_inner(
@@ -179,75 +189,77 @@ impl ConnectionPermit {
     /// The `label` should be something like `"TCP connection"`.
     pub fn new(ip: IpAddr, label: &str) -> Option<Self> {
         let now = Instant::now();
-        let mut limiter = SINGLETON.lock().unwrap();
-        let limiter = &mut *limiter;
-        if limiter.total_connection_permits >= limiter.total_connections_hard_limit {
-            return None;
-        }
-        let entry = limiter.usage.entry(ip).or_insert_with(|| Usage::new(now));
-        let should_rate_limit =
-            entry
-                .rate_limit
-                .should_limit_rate_with_now_and_usage(&limiter.props, now, 10000);
+        IpLimiter::with_singleton(|limiter| {
+            if limiter.total_connection_permits >= limiter.total_connections_hard_limit {
+                return None;
+            }
+            let entry = limiter.usage.entry(ip).or_insert_with(|| Usage::new(now));
+            let should_rate_limit =
+                entry
+                    .rate_limit
+                    .should_limit_rate_with_now_and_usage(&limiter.props, now, 10000);
 
-        if should_rate_limit {
-            if !limiter
-                .warning_limiter
-                .should_limit_rate_with_now(&WARNING_LIMIT, now)
-            {
-                warn!("Refusing new {label} for {ip} close to bandwidth limit");
-            }
-            entry.stats.increment_hard_limited();
-            return None;
-        }
-        let old = now.duration_since(entry.stats.first) > Duration::from_secs(60);
-        let enforce_soft_limit = (!old || entry.stats.hard_limited > 0)
-            && limiter.total_connection_permits >= limiter.total_connections_soft_limit;
-        let soft_limit = (entry.stats.active_sessions + 1).saturating_mul(if enforce_soft_limit {
-            limiter.connections_per_active_p90
-        } else {
-            limiter.connections_per_active_p99
-        });
-        let hard_limit = if enforce_soft_limit {
-            soft_limit
-        } else {
-            soft_limit.saturating_add(limiter.connections_per_active_p90)
-        };
-        let hit_hard_limit = entry.stats.connection_permits >= hard_limit;
-        if hit_hard_limit || (entry.stats.connection_permits >= soft_limit && random()) {
-            if hit_hard_limit {
+            if should_rate_limit {
+                if !limiter
+                    .warning_limiter
+                    .should_limit_rate_with_now(&WARNING_LIMIT, now)
+                {
+                    warn!("Refusing new {label} for {ip} close to bandwidth limit");
+                }
                 entry.stats.increment_hard_limited();
+                return None;
             }
-            if !limiter
-                .warning_limiter
-                .should_limit_rate_with_now(&WARNING_LIMIT, now)
-            {
-                warn!(
-                    "Count limiting {label} for {ip} ({} conn of max {soft_limit}, {} active)",
-                    entry.stats.connection_permits, entry.stats.active_sessions
-                );
+            let old = now.duration_since(entry.stats.first) > Duration::from_secs(60);
+            let enforce_soft_limit = (!old || entry.stats.hard_limited > 0)
+                && limiter.total_connection_permits >= limiter.total_connections_soft_limit;
+            let soft_limit =
+                (entry.stats.active_sessions + 1).saturating_mul(if enforce_soft_limit {
+                    limiter.connections_per_active_p90
+                } else {
+                    limiter.connections_per_active_p99
+                });
+            let hard_limit = if enforce_soft_limit {
+                soft_limit
+            } else {
+                soft_limit.saturating_add(limiter.connections_per_active_p90)
+            };
+            let hit_hard_limit = entry.stats.connection_permits >= hard_limit;
+            if hit_hard_limit || (entry.stats.connection_permits >= soft_limit && random()) {
+                if hit_hard_limit {
+                    entry.stats.increment_hard_limited();
+                }
+                if !limiter
+                    .warning_limiter
+                    .should_limit_rate_with_now(&WARNING_LIMIT, now)
+                {
+                    warn!(
+                        "Count limiting {label} for {ip} ({} conn of max {soft_limit}, {} active)",
+                        entry.stats.connection_permits, entry.stats.active_sessions
+                    );
+                }
+                None
+            } else {
+                entry.stats.connection_permits += 1;
+                limiter.total_connection_permits += 1;
+                Some(Self(ip))
             }
-            None
-        } else {
-            entry.stats.connection_permits += 1;
-            limiter.total_connection_permits += 1;
-            Some(Self(ip))
-        }
+        })
     }
 }
 
 impl Drop for ConnectionPermit {
     fn drop(&mut self) {
-        let mut limiter = SINGLETON.lock().unwrap();
-        if let Some(usage) = limiter.usage.get_mut(&self.0) {
-            debug_assert!(usage.stats.connection_permits > 0);
-            usage.stats.connection_permits = usage.stats.connection_permits.saturating_sub(1);
-        } else {
-            debug_assert!(false);
-        }
-        // Fail open by subtracting from the total even if `get_mut` returned `None`.
-        debug_assert!(limiter.total_connection_permits > 0);
-        limiter.total_connection_permits = limiter.total_connection_permits.saturating_sub(1);
+        IpLimiter::with_singleton(|limiter| {
+            if let Some(usage) = limiter.usage.get_mut(&self.0) {
+                debug_assert!(usage.stats.connection_permits > 0);
+                usage.stats.connection_permits = usage.stats.connection_permits.saturating_sub(1);
+            } else {
+                debug_assert!(false);
+            }
+            // Fail open by subtracting from the total even if `get_mut` returned `None`.
+            debug_assert!(limiter.total_connection_permits > 0);
+            limiter.total_connection_permits = limiter.total_connection_permits.saturating_sub(1);
+        })
     }
 }
 
@@ -259,26 +271,28 @@ pub struct ActiveSession(IpAddr);
 impl ActiveSession {
     /// Keep the [ActiveSession] as long as meaningful activity is taking place.
     pub fn new(addr: IpAddr) -> Self {
-        SINGLETON
-            .lock()
-            .unwrap()
-            .usage
-            .entry(addr)
-            .or_insert_with(|| Usage::new(Instant::now()))
-            .stats
-            .active_sessions += 1;
-        Self(addr)
+        IpLimiter::with_singleton(|limiter| {
+            limiter
+                .usage
+                .entry(addr)
+                .or_insert_with(|| Usage::new(Instant::now()))
+                .stats
+                .active_sessions += 1;
+            Self(addr)
+        })
     }
 }
 
 impl Drop for ActiveSession {
     fn drop(&mut self) {
-        if let Some(usage) = SINGLETON.lock().unwrap().usage.get_mut(&self.0) {
-            debug_assert!(usage.stats.active_sessions > 0);
-            usage.stats.active_sessions = usage.stats.active_sessions.saturating_sub(1);
-        } else {
-            debug_assert!(false);
-        }
+        IpLimiter::with_singleton(|limiter| {
+            if let Some(usage) = limiter.usage.get_mut(&self.0) {
+                debug_assert!(usage.stats.active_sessions > 0);
+                usage.stats.active_sessions = usage.stats.active_sessions.saturating_sub(1);
+            } else {
+                debug_assert!(false);
+            }
+        })
     }
 }
 
