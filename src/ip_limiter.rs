@@ -142,9 +142,9 @@ impl IpLimiter {
         Self::with_singleton(|this| this.should_limit_bandwidth_inner(ip, bytes, label, now))
     }
 
-    /// Call when processing a message of `bytes` bytes from `ip` at `now`.
+    /// Call to rate limit some custom (perhaps expensive) action per IP.
     ///
-    /// If this returns `true`, block the `usage` of bandwidth.
+    /// If this returns `true`, block the `usage`.
     pub fn should_limit_custom(ip: IpAddr, usage: Units, now: Instant) -> bool {
         Self::with_singleton(|this| {
             let entry = this.usage.entry(ip).or_insert_with(|| Usage::new(now));
