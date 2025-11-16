@@ -14,7 +14,8 @@ static SINGLETON: Mutex<Option<IpLimiter>> = Mutex::new(None);
 #[derive(Debug)]
 pub struct IpLimiter {
     usage: FxHashMap<IpAddr, Usage>,
-    props: RateLimiterProps,
+    connection_rate_limit: RateLimiterProps,
+    custom_rate_limit: RateLimiterProps,
     next_prune: Instant,
     warning_limiter: RateLimiterState,
     connections_per_active_p90: u32,
@@ -75,7 +76,15 @@ impl IpLimiter {
     /// Default: 500,000 bytes per second, 0 bytes burst.
     pub fn set_bandwidth_limits(bytes_per_second: Units, bytes_burst: Units) {
         Self::with_singleton(|this| {
-            this.props = RateLimiterProps::new_throughput(bytes_per_second, bytes_burst);
+            this.connection_rate_limit =
+                RateLimiterProps::new_throughput(bytes_per_second, bytes_burst);
+        })
+    }
+
+    /// Set the properties of the custom rate limit corresponding to each IP.
+    pub fn set_custom_limits(props: RateLimiterProps) {
+        Self::with_singleton(|this| {
+            this.custom_rate_limit = props;
         })
     }
 
@@ -133,6 +142,18 @@ impl IpLimiter {
         Self::with_singleton(|this| this.should_limit_bandwidth_inner(ip, bytes, label, now))
     }
 
+    /// Call when processing a message of `bytes` bytes from `ip` at `now`.
+    ///
+    /// If this returns `true`, block the `usage` of bandwidth.
+    pub fn should_limit_custom(ip: IpAddr, usage: Units, now: Instant) -> bool {
+        Self::with_singleton(|this| {
+            let entry = this.usage.entry(ip).or_insert_with(|| Usage::new(now));
+            entry
+                .custom_rate_limit
+                .should_limit_rate_with_now_and_usage(&this.custom_rate_limit, now, usage)
+        })
+    }
+
     pub(crate) fn should_limit_bandwidth_inner(
         &mut self,
         ip: IpAddr,
@@ -154,14 +175,19 @@ impl IpLimiter {
 
 #[derive(Debug)]
 struct Usage {
-    rate_limit: RateLimiterState,
+    connection_rate_limit: RateLimiterState,
+    custom_rate_limit: RateLimiterState,
     stats: IpStats,
 }
 
 impl Usage {
     fn new(now: Instant) -> Self {
         Self {
-            rate_limit: RateLimiterState {
+            connection_rate_limit: RateLimiterState {
+                until: now,
+                burst_used: 0,
+            },
+            custom_rate_limit: RateLimiterState {
                 until: now,
                 burst_used: 0,
             },
@@ -194,10 +220,9 @@ impl ConnectionPermit {
                 return None;
             }
             let entry = limiter.usage.entry(ip).or_insert_with(|| Usage::new(now));
-            let should_rate_limit =
-                entry
-                    .rate_limit
-                    .should_limit_rate_with_now_and_usage(&limiter.props, now, 10000);
+            let should_rate_limit = entry
+                .connection_rate_limit
+                .should_limit_rate_with_now_and_usage(&limiter.connection_rate_limit, now, 10000);
 
             if should_rate_limit {
                 if !limiter
@@ -301,7 +326,8 @@ impl IpLimiter {
     pub(crate) fn new(bytes_per_second: Units, bytes_burst: Units) -> Self {
         Self {
             usage: FxHashMap::default(),
-            props: RateLimiterProps::new_throughput(bytes_per_second, bytes_burst),
+            connection_rate_limit: RateLimiterProps::new_throughput(bytes_per_second, bytes_burst),
+            custom_rate_limit: RateLimiterProps::no_limit(),
             next_prune: Instant::now(),
             warning_limiter: Default::default(),
             connections_per_active_p90: 1,
@@ -321,10 +347,9 @@ impl IpLimiter {
         now: Instant,
     ) -> bool {
         let entry = self.usage.entry(ip).or_insert_with(|| Usage::new(now));
-        let should_limit_rate =
-            entry
-                .rate_limit
-                .should_limit_rate_with_now_and_usage(&self.props, now, bytes);
+        let should_limit_rate = entry
+            .connection_rate_limit
+            .should_limit_rate_with_now_and_usage(&self.connection_rate_limit, now, bytes);
 
         if should_limit_rate {
             entry.stats.increment_hard_limited();
@@ -346,7 +371,8 @@ impl IpLimiter {
 
     fn prune(&mut self, now: Instant) {
         self.usage.retain(|_, usage: &mut Usage| {
-            usage.rate_limit.until > now
+            usage.connection_rate_limit.until > now
+                || usage.custom_rate_limit.until > now
                 || usage.stats.active_sessions > 0
                 || usage.stats.connection_permits > 0
         })
