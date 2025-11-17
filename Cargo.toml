@@ -19,8 +19,17 @@ tokio = { version = "1.39.3", features = ["net"], default-features = false, opti
 tower = { version = "0.4", optional = true }
 pin-project = { version = "1.1", optional = true }
 
+[dev-dependencies]
+axum = { version = "=0.8.1", features = ["ws"], default-features = false }
+env_logger = "0.11.8"
+futures-util = "0.3.31"
+hyper = { version = "=1.6.0" }
+hyper-util = { version = "=0.1.7", features = [ "tokio" ] }
+tokio = { version = "1.39.3", features = ["net", "rt-multi-thread"], default-features = false }
+tokio-websockets = { version = "0.12.3", features = ["client", "rand", "ring"], default-features = false}
+
 [features]
-default = []
+default = ["axum"]
 tokio = ["dep:tokio", "socket2"]
 axum = ["dep:axum", "axum-server", "tokio", "tower", "pin-project"]
 

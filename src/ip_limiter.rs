@@ -20,9 +20,12 @@ pub struct IpLimiter {
     warning_limiter: RateLimiterState,
     connections_per_active_p90: u32,
     connections_per_active_p99: u32,
-    total_connection_permits: u32,
+    total_connections: u32,
     total_connections_soft_limit: u32,
     total_connections_hard_limit: u32,
+    last_soft_limit: Option<Instant>,
+    ddos_memory: Duration,
+    compute_pressure: bool,
 }
 
 /// Summary statistics for a given IP.
@@ -32,23 +35,23 @@ pub struct IpStats {
     /// First connection (since the last time this IP was last garbage collected).
     pub first: Instant,
     /// Number of outstanding [ConnectionPermit]s.
-    pub connection_permits: u32,
+    pub connections: u32,
     /// Number of outstanding [ActiveSession]s.
     pub active_sessions: u32,
-    /// Counts the number of this times this IP hit a hard limit.
-    pub hard_limited: u32,
+    /// Last time this IP hit a hard limit.
+    pub last_hard_limit: Option<Instant>,
 }
 
 impl IpStats {
-    fn increment_hard_limited(&mut self) {
-        self.hard_limited = self.hard_limited.saturating_add(1);
+    fn increment_hard_limited(&mut self, now: Instant) {
+        self.last_hard_limit = Some(now);
     }
 }
 
 impl IpLimiter {
     fn with_singleton<R>(f: impl FnOnce(&mut Self) -> R) -> R {
         let mut opt = SINGLETON.lock().unwrap();
-        let this = opt.get_or_insert_with(|| Self::new(500000, 0));
+        let this = opt.get_or_insert_with(|| Self::new(500000, 1000000));
         // Yikes..
         f(this)
     }
@@ -66,14 +69,14 @@ impl IpLimiter {
 
     /// Total number of outstanding [ConnectionPermit]s.
     pub fn total_connections() -> u32 {
-        Self::with_singleton(|this| this.total_connection_permits)
+        Self::with_singleton(|this| this.total_connections)
     }
 
     /// Set the bandwidth limits for the [IpLimiter] singleton.
     ///
     /// The `bytes_per_second` should be less than 1,000,000,000.
     ///
-    /// Default: 500,000 bytes per second, 0 bytes burst.
+    /// Default: 500,000 bytes per second, 1,000,000 bytes burst.
     pub fn set_bandwidth_limits(bytes_per_second: Units, bytes_burst: Units) {
         Self::with_singleton(|this| {
             this.connection_rate_limit =
@@ -94,9 +97,9 @@ impl IpLimiter {
     /// For example:
     /// - if you have an HTTP/1-only server, set this to 4-6.
     /// - if you have an HTTP/2 server with HTTP/1 WebSockets, set this to 2.
-    /// - if you have an HTTP/2 server with HTTP/2 WebSockets, set this to 1.
+    /// - if you have an HTTP/2 server (possibly with HTTP/2 WebSockets), set this to 1.
     ///
-    /// Default: 1 (i.e. typical HTTP/2 clients)
+    /// Default: 1
     pub fn set_connections_per_active_p90(connections_per_active_p90: u32) {
         Self::with_singleton(|this| {
             this.connections_per_active_p90 = connections_per_active_p90;
@@ -154,6 +157,28 @@ impl IpLimiter {
         })
     }
 
+    /// Set how long a DDoS incident will be be remembered.
+    ///
+    /// Default: 10m
+    pub fn set_ddos_memory(ddos_memory: Duration) {
+        Self::with_singleton(|this| {
+            this.ddos_memory = ddos_memory;
+        })
+    }
+
+    /// Call with `true` any time the host's CPU and/or RAM are nearly exausted,
+    /// then call with `false` when they are back to normal.
+    ///
+    /// This can trigger additional connection limiting before the connection
+    /// count hits the value set by [Self::set_total_connections_soft_limit].
+    ///
+    /// Default: `false`
+    pub fn set_compute_pressure(compute_pressure: bool) {
+        Self::with_singleton(|this| {
+            this.compute_pressure = compute_pressure;
+        })
+    }
+
     pub(crate) fn should_limit_bandwidth_inner(
         &mut self,
         ip: IpAddr,
@@ -167,7 +192,7 @@ impl IpLimiter {
                 .warning_limiter
                 .should_limit_rate_with_now(&WARNING_LIMIT, now);
         if should_warn {
-            warn!("Bandwidth limiting {label} for {ip}");
+            warn!("bandwidth limiting {label} of {ip}");
         }
         should_rate_limit
     }
@@ -193,15 +218,15 @@ impl Usage {
             },
             stats: IpStats {
                 first: now,
-                connection_permits: 0,
+                connections: 0,
                 active_sessions: 0,
-                hard_limited: 0,
+                last_hard_limit: None,
             },
         }
     }
 }
 
-const WARNING_LIMIT: RateLimiterProps = RateLimiterProps::const_new(Duration::from_millis(100), 3);
+const WARNING_LIMIT: RateLimiterProps = RateLimiterProps::const_new(Duration::from_millis(500), 3);
 
 /// A RAII guard representing a permissible, long-lived connection (such as a TCP stream).
 #[derive(Debug)]
@@ -216,7 +241,7 @@ impl ConnectionPermit {
     pub fn new(ip: IpAddr, label: &str) -> Option<Self> {
         let now = Instant::now();
         IpLimiter::with_singleton(|limiter| {
-            if limiter.total_connection_permits >= limiter.total_connections_hard_limit {
+            if limiter.total_connections >= limiter.total_connections_hard_limit {
                 return None;
             }
             let entry = limiter.usage.entry(ip).or_insert_with(|| Usage::new(now));
@@ -229,14 +254,27 @@ impl ConnectionPermit {
                     .warning_limiter
                     .should_limit_rate_with_now(&WARNING_LIMIT, now)
                 {
-                    warn!("Refusing new {label} for {ip} close to bandwidth limit");
+                    warn!("refusing {label} of {ip} (close to bw limit)");
                 }
-                entry.stats.increment_hard_limited();
+                entry.stats.increment_hard_limited(now);
                 return None;
             }
             let old = now.duration_since(entry.stats.first) > Duration::from_secs(60);
-            let enforce_soft_limit = (!old || entry.stats.hard_limited > 0)
-                && limiter.total_connection_permits >= limiter.total_connections_soft_limit;
+            let soft_limit_reached = limiter.compute_pressure
+                || limiter.total_connections >= limiter.total_connections_soft_limit;
+            if soft_limit_reached {
+                limiter.last_soft_limit = Some(now);
+            }
+            let recent_global_soft_limit = limiter
+                .last_soft_limit
+                .filter(|&last| now.duration_since(last) < limiter.ddos_memory)
+                .is_some();
+            let recent_local_hard_limit = entry
+                .stats
+                .last_hard_limit
+                .filter(|&last| now.duration_since(last) < limiter.ddos_memory)
+                .is_some();
+            let enforce_soft_limit = (!old || recent_local_hard_limit) && recent_global_soft_limit;
             let soft_limit =
                 (entry.stats.active_sessions + 1).saturating_mul(if enforce_soft_limit {
                     limiter.connections_per_active_p90
@@ -248,24 +286,24 @@ impl ConnectionPermit {
             } else {
                 soft_limit.saturating_add(limiter.connections_per_active_p90)
             };
-            let hit_hard_limit = entry.stats.connection_permits >= hard_limit;
-            if hit_hard_limit || (entry.stats.connection_permits >= soft_limit && random()) {
+            let hit_hard_limit = entry.stats.connections >= hard_limit;
+            if hit_hard_limit || (entry.stats.connections >= soft_limit && random()) {
                 if hit_hard_limit {
-                    entry.stats.increment_hard_limited();
+                    entry.stats.increment_hard_limited(now);
                 }
                 if !limiter
                     .warning_limiter
                     .should_limit_rate_with_now(&WARNING_LIMIT, now)
                 {
                     warn!(
-                        "Count limiting {label} for {ip} ({} conn of max {soft_limit}, {} active)",
-                        entry.stats.connection_permits, entry.stats.active_sessions
+                        "count limiting {label} of {ip} ({} conn of max {soft_limit}, {} active)",
+                        entry.stats.connections, entry.stats.active_sessions
                     );
                 }
                 None
             } else {
-                entry.stats.connection_permits += 1;
-                limiter.total_connection_permits += 1;
+                entry.stats.connections += 1;
+                limiter.total_connections += 1;
                 Some(Self(ip))
             }
         })
@@ -276,14 +314,14 @@ impl Drop for ConnectionPermit {
     fn drop(&mut self) {
         IpLimiter::with_singleton(|limiter| {
             if let Some(usage) = limiter.usage.get_mut(&self.0) {
-                debug_assert!(usage.stats.connection_permits > 0);
-                usage.stats.connection_permits = usage.stats.connection_permits.saturating_sub(1);
+                debug_assert!(usage.stats.connections > 0);
+                usage.stats.connections = usage.stats.connections.saturating_sub(1);
             } else {
                 debug_assert!(false);
             }
             // Fail open by subtracting from the total even if `get_mut` returned `None`.
-            debug_assert!(limiter.total_connection_permits > 0);
-            limiter.total_connection_permits = limiter.total_connection_permits.saturating_sub(1);
+            debug_assert!(limiter.total_connections > 0);
+            limiter.total_connections = limiter.total_connections.saturating_sub(1);
         })
     }
 }
@@ -332,9 +370,12 @@ impl IpLimiter {
             warning_limiter: Default::default(),
             connections_per_active_p90: 1,
             connections_per_active_p99: 6,
-            total_connection_permits: 0,
+            total_connections: 0,
             total_connections_soft_limit: 300,
             total_connections_hard_limit: 1000,
+            last_soft_limit: None,
+            ddos_memory: Duration::from_secs(5 * 60),
+            compute_pressure: false,
         }
     }
 
@@ -352,7 +393,7 @@ impl IpLimiter {
             .should_limit_rate_with_now_and_usage(&self.connection_rate_limit, now, bytes);
 
         if should_limit_rate {
-            entry.stats.increment_hard_limited();
+            entry.stats.increment_hard_limited(now);
         }
 
         self.maybe_prune(now);
@@ -365,16 +406,17 @@ impl IpLimiter {
         if now < self.next_prune {
             return;
         }
-        self.next_prune = now + Duration::from_secs(5);
+        self.next_prune = now + Duration::from_secs(5).max(self.ddos_memory / 2);
         self.prune(now);
     }
 
     fn prune(&mut self, now: Instant) {
+        let forget = now + self.ddos_memory;
         self.usage.retain(|_, usage: &mut Usage| {
-            usage.connection_rate_limit.until > now
-                || usage.custom_rate_limit.until > now
+            usage.connection_rate_limit.until > forget
+                || usage.custom_rate_limit.until > forget
                 || usage.stats.active_sessions > 0
-                || usage.stats.connection_permits > 0
+                || usage.stats.connections > 0
         })
     }
 
@@ -402,6 +444,8 @@ mod test {
         let ip_one = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
         let ip_two = IpAddr::V6(Ipv6Addr::new(1, 2, 3, 4, 5, 6, 7, 8));
         let mut limiter = IpLimiter::new(10, 3);
+
+        limiter.ddos_memory = Duration::ZERO;
 
         assert_eq!(limiter.len(), 0);
         assert!(!limiter.should_limit_bandwidth_inner_inner(ip_one, 1, Instant::now()));

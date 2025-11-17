@@ -15,8 +15,12 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tower::Service;
 
-/// Wraps an `axum_server` acceptor for configuring TCP keepalive and installing a [TcpStream]
-/// kill switch that can be activated from an [axum::Router].
+/// Wraps an `axum_server` acceptor that does the following:
+/// - configures `TCP_KEEPALIVE` to expire dormant connections faster
+/// - configures `TCP_NODELAY` for efficiency
+/// - wraps the [TcpStream] in a [KillSwitchStream] that can be
+///   activated using a [KillSwitch] extension in an [axum::Router]
+///   handler.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AxumServerAcceptor<S, I>(I, PhantomData<S>);
 

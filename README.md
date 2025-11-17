@@ -16,6 +16,7 @@ DoS and DDoS protection library.
 - [x] Optional `axum` and `axum_server` support
 - [x] Logging
 - [ ] `nftables` firewall configuration
+- [ ] OS network stack hardening
 
 ## Status
 
