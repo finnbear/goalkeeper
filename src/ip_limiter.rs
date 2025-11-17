@@ -18,6 +18,7 @@ pub struct IpLimiter {
     custom_rate_limit: RateLimiterProps,
     next_prune: Instant,
     warning_limiter: RateLimiterState,
+    pending: WarningSet,
     connections_per_active_p90: u32,
     connections_per_active_p99: u32,
     total_connections: u32,
@@ -26,6 +27,34 @@ pub struct IpLimiter {
     last_soft_limit: Option<Instant>,
     ddos_memory: Duration,
     compute_pressure: bool,
+}
+
+#[derive(Debug)]
+struct WarningSet {
+    small: Vec<Warning>,
+    small_full: bool,
+    bandwidth: FxHashMap<IpAddr, u32>,
+    connections: FxHashMap<IpAddr, u32>,
+}
+
+#[derive(Debug)]
+struct Warning {
+    ip: IpAddr,
+    kind: WarningKind,
+    label: &'static str,
+}
+
+#[derive(Debug)]
+enum WarningKind {
+    Bandwidth {
+        amount: u32,
+    },
+    ConnectionCount {
+        connections: u32,
+        active_sessions: u32,
+        limit: u32,
+        hard: bool,
+    },
 }
 
 /// Summary statistics for a given IP.
@@ -141,7 +170,12 @@ impl IpLimiter {
     /// Call when processing a message of `bytes` bytes from `ip` at `now`.
     ///
     /// If this returns `true`, block the `usage` of bandwidth.
-    pub fn should_limit_bandwidth(ip: IpAddr, bytes: Units, label: &str, now: Instant) -> bool {
+    pub fn should_limit_bandwidth(
+        ip: IpAddr,
+        bytes: Units,
+        label: &'static str,
+        now: Instant,
+    ) -> bool {
         Self::with_singleton(|this| this.should_limit_bandwidth_inner(ip, bytes, label, now))
     }
 
@@ -183,16 +217,19 @@ impl IpLimiter {
         &mut self,
         ip: IpAddr,
         bytes: Units,
-        label: &str,
+        label: &'static str,
         now: Instant,
     ) -> bool {
         let should_rate_limit = self.should_limit_bandwidth_inner_inner(ip, bytes, now);
-        let should_warn = should_rate_limit
-            && !self
-                .warning_limiter
-                .should_limit_rate_with_now(&WARNING_LIMIT, now);
-        if should_warn {
-            warn!("bandwidth limiting {label} of {ip}");
+        if should_rate_limit {
+            self.warn(
+                Warning {
+                    label,
+                    ip,
+                    kind: WarningKind::Bandwidth { amount: bytes },
+                },
+                now,
+            );
         }
         should_rate_limit
     }
@@ -226,7 +263,7 @@ impl Usage {
     }
 }
 
-const WARNING_LIMIT: RateLimiterProps = RateLimiterProps::const_new(Duration::from_millis(500), 3);
+const WARNING_LIMIT: RateLimiterProps = RateLimiterProps::const_new(Duration::from_secs(1), 0);
 
 /// A RAII guard representing a permissible, long-lived connection (such as a TCP stream).
 #[derive(Debug)]
@@ -238,25 +275,29 @@ impl ConnectionPermit {
     /// `None`, reject the connection.
     ///
     /// The `label` should be something like `"TCP connection"`.
-    pub fn new(ip: IpAddr, label: &str) -> Option<Self> {
+    pub fn new(ip: IpAddr, label: &'static str) -> Option<Self> {
         let now = Instant::now();
         IpLimiter::with_singleton(|limiter| {
             if limiter.total_connections >= limiter.total_connections_hard_limit {
                 return None;
             }
             let entry = limiter.usage.entry(ip).or_insert_with(|| Usage::new(now));
+            // Represents overhead of starting a new connection.
+            let amount = 10000;
             let should_rate_limit = entry
                 .connection_rate_limit
-                .should_limit_rate_with_now_and_usage(&limiter.connection_rate_limit, now, 10000);
+                .should_limit_rate_with_now_and_usage(&limiter.connection_rate_limit, now, amount);
 
             if should_rate_limit {
-                if !limiter
-                    .warning_limiter
-                    .should_limit_rate_with_now(&WARNING_LIMIT, now)
-                {
-                    warn!("refusing {label} of {ip} (close to bw limit)");
-                }
                 entry.stats.increment_hard_limited(now);
+                limiter.warn(
+                    Warning {
+                        label,
+                        ip,
+                        kind: WarningKind::Bandwidth { amount },
+                    },
+                    now,
+                );
                 return None;
             }
             let old = now.duration_since(entry.stats.first) > Duration::from_secs(60);
@@ -291,15 +332,21 @@ impl ConnectionPermit {
                 if hit_hard_limit {
                     entry.stats.increment_hard_limited(now);
                 }
-                if !limiter
-                    .warning_limiter
-                    .should_limit_rate_with_now(&WARNING_LIMIT, now)
-                {
-                    warn!(
-                        "count limiting {label} of {ip} ({} conn of max {soft_limit}, {} active)",
-                        entry.stats.connections, entry.stats.active_sessions
-                    );
-                }
+                let warning = Warning {
+                    ip,
+                    label,
+                    kind: WarningKind::ConnectionCount {
+                        connections: entry.stats.connections,
+                        active_sessions: entry.stats.active_sessions,
+                        limit: if hit_hard_limit {
+                            hard_limit
+                        } else {
+                            soft_limit
+                        },
+                        hard: hit_hard_limit,
+                    },
+                };
+                limiter.warn(warning, now);
                 None
             } else {
                 entry.stats.connections += 1;
@@ -368,6 +415,12 @@ impl IpLimiter {
             custom_rate_limit: RateLimiterProps::no_limit(),
             next_prune: Instant::now(),
             warning_limiter: Default::default(),
+            pending: WarningSet {
+                small: Vec::with_capacity(5),
+                small_full: false,
+                bandwidth: Default::default(),
+                connections: Default::default(),
+            },
             connections_per_active_p90: 1,
             connections_per_active_p99: 6,
             total_connections: 0,
@@ -377,6 +430,94 @@ impl IpLimiter {
             ddos_memory: Duration::from_secs(5 * 60),
             compute_pressure: false,
         }
+    }
+
+    fn warn(&mut self, warning: Warning, now: Instant) {
+        if !self.pending.small_full && self.pending.small.len() < 5 {
+            self.pending.small.push(warning);
+        } else {
+            self.pending.small_full = true;
+            for warning in self.pending.small.drain(..).chain(std::iter::once(warning)) {
+                match warning.kind {
+                    WarningKind::Bandwidth { amount } => {
+                        let entry = self.pending.bandwidth.entry(warning.ip).or_default();
+                        *entry = entry.saturating_add(amount);
+                    }
+                    WarningKind::ConnectionCount { .. } => {
+                        let entry = self.pending.connections.entry(warning.ip).or_default();
+                        *entry = entry.saturating_add(1);
+                    }
+                }
+            }
+        }
+
+        if self
+            .warning_limiter
+            .should_limit_rate_with_now(&WARNING_LIMIT, now)
+        {
+            return;
+        }
+
+        if !self.pending.small_full {
+            for Warning { ip, label, kind } in self.pending.small.drain(..) {
+                match kind {
+                    WarningKind::Bandwidth { amount } => {
+                        warn!("{ip} exceeded bw limit with {label} ({amount}B)");
+                    }
+                    WarningKind::ConnectionCount {
+                        connections,
+                        active_sessions,
+                        limit,
+                        hard,
+                    } => {
+                        warn!("{ip} hit {} conn limit {limit} with {label} ({active_sessions} act, {connections} tot)", if hard {
+                            "hard"
+                        } else {
+                            "soft"
+                        });
+                    }
+                }
+            }
+            return;
+        }
+
+        if let Some(sample) = self.pending.bandwidth.keys().next() {
+            let mut bytes = self
+                .pending
+                .bandwidth
+                .values()
+                .copied()
+                .map(|v| v as u64)
+                .sum::<u64>();
+            let mut unit = "B";
+            if bytes >= 1000 {
+                bytes /= 1000;
+                unit = "KB";
+            }
+            if bytes >= 1000 {
+                bytes /= 1000;
+                unit = "MB";
+            }
+            if bytes >= 1000 {
+                bytes /= 1000;
+                unit = "GB";
+            }
+            warn!(
+                "{} IP's, e.g. {sample}, hit bw limit with {bytes}{unit}",
+                self.pending.bandwidth.len()
+            );
+            self.pending.bandwidth.clear();
+        }
+        if let Some(sample) = self.pending.bandwidth.keys().next() {
+            let attempts = self.pending.connections.values().copied().sum::<u32>();
+            warn!(
+                "{} IP's, e.g. {sample}, hit conn limit with {attempts} attempts",
+                self.pending.connections.len()
+            );
+            self.pending.connections.clear();
+        }
+
+        self.pending.small_full = false;
     }
 
     /// Marks usage as being performed by the ip address.

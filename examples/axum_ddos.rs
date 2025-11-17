@@ -13,7 +13,7 @@ use goalkeeper::{
     rate_limiter::RateLimiterProps,
 };
 use hyper::StatusCode;
-use log::LevelFilter;
+use log::{info, LevelFilter};
 use std::{
     io,
     net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -25,6 +25,8 @@ use tokio::net::TcpStream;
 #[tokio::main]
 pub async fn main() {
     env_logger::builder().filter_level(LevelFilter::Info).init();
+
+    info!("you must run this example on Linux, as root");
 
     IpLimiter::set_custom_limits(RateLimiterProps::new(Duration::from_secs(1), 3));
     IpLimiter::set_total_connections_soft_limit(16);
@@ -140,6 +142,7 @@ pub async fn main() {
                         .await
                     else {
                         assert_ne!(abuse, Default::default());
+                        tokio::time::sleep(Duration::from_millis(10)).await;
                         continue;
                     };
 
