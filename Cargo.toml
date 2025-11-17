@@ -33,5 +33,9 @@ default = []
 tokio = ["dep:tokio", "socket2"]
 axum = ["dep:axum", "axum-server", "tokio", "tower", "pin-project"]
 
+[[example]]
+name = "axum_ddos"
+required-features = ["axum"]
+
 [package.metadata.docs.rs]
 all-features = true
