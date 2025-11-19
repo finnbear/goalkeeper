@@ -5,10 +5,181 @@ use fxhash::FxHashMap;
 use log::warn;
 use rand::random;
 use std::net::IpAddr;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-static SINGLETON: Mutex<Option<IpLimiter>> = Mutex::new(None);
+/// Provides a mutable reference to some [IpLimiter].
+pub trait ProvideIpLimiter: Clone {
+    /// Visit a mutable refererence to the [IpLimiter].
+    fn provide_ip_limiter<R>(&self, f: impl FnOnce(&mut IpLimiter) -> R) -> R;
+
+    /// Visit the [IpStats] for each tracked IP.
+    ///
+    /// The `visitor` should never block.
+    fn stats(&self, mut visitor: impl FnMut(IpAddr, IpStats)) {
+        self.provide_ip_limiter(|this| {
+            for (ip, v) in &this.usage {
+                visitor(*ip, v.stats);
+            }
+        });
+    }
+
+    /// Total number of outstanding [ConnectionPermit]s.
+    fn total_connections(&self) -> u32 {
+        self.provide_ip_limiter(|this| this.total_connections)
+    }
+
+    /// Set the bandwidth limits for the [IpLimiter].
+    ///
+    /// The `bytes_per_second` should be less than 1,000,000,000.
+    ///
+    /// Default: 500,000 bytes per second, 1,000,000 bytes burst.
+    fn set_bandwidth_limits(&self, bytes_per_second: Units, bytes_burst: Units) {
+        self.provide_ip_limiter(|this| {
+            this.connection_rate_limit =
+                RateLimiterProps::new_throughput(bytes_per_second, bytes_burst);
+        })
+    }
+
+    /// Set the properties of the custom rate limit corresponding to each IP.
+    fn set_custom_limits(&self, props: RateLimiterProps) {
+        self.provide_ip_limiter(|this| {
+            this.custom_rate_limit = props;
+        })
+    }
+
+    /// Set the 90th percentile number of [ConnectionPermit]s required for
+    /// an [ActiveSession] for the [IpLimiter]. This should always
+    /// be less than or equal to the value set by
+    /// [Self::set_connections_per_active_p99].
+    ///
+    /// For example:
+    /// - if you have an HTTP/1-only server, set this to 4-6.
+    /// - if you have an HTTP/2 server with HTTP/1 WebSockets, set this to 2.
+    /// - if you have an HTTP/2 server (possibly with HTTP/2 WebSockets), set this to 1.
+    ///
+    /// Default: 1
+    fn set_connections_per_active_p90(&self, connections_per_active_p90: u32) {
+        self.provide_ip_limiter(|this| {
+            this.connections_per_active_p90 = connections_per_active_p90;
+            this.connections_per_active_p99 = this
+                .connections_per_active_p99
+                .max(connections_per_active_p90);
+        })
+    }
+
+    /// Set the 99th+ percentile number of [ConnectionPermit]s required for
+    /// an [ActiveSession] for the [IpLimiter]. This should always
+    /// be greater than or equal to the value set by
+    /// [Self::set_connections_per_active_p90].
+    ///
+    /// For example, if your server accepts HTTP/1 clients, set this to 6-12.
+    ///
+    /// Default: 6
+    fn set_connections_per_active_p99(&self, connections_per_active_p99: u32) {
+        self.provide_ip_limiter(|this| {
+            this.connections_per_active_p99 = connections_per_active_p99;
+            this.connections_per_active_p90 = this
+                .connections_per_active_p90
+                .min(connections_per_active_p99);
+        })
+    }
+
+    /// Set the soft maximum number of [ConnectionPermit]s, across all IP's,
+    /// before fewer new [ConnectionPermit]s are afforded to each IP.
+    ///
+    /// Default: 300
+    fn set_total_connections_soft_limit(&self, total_connections_soft_limit: u32) {
+        self.provide_ip_limiter(|this| {
+            this.total_connections_soft_limit = total_connections_soft_limit;
+        })
+    }
+
+    /// Set the hard limit on the number of [ConnectionPermit]s, across all IP's,
+    /// before all new [ConnectionPermit]s are denied.
+    ///
+    /// Default 1000.
+    fn set_total_connections_hard_limit(&self, total_connections_hard_limit: u32) {
+        self.provide_ip_limiter(|this| {
+            this.total_connections_hard_limit = total_connections_hard_limit;
+        })
+    }
+
+    /// Call when processing a message of `bytes` bytes from `ip` at `now`.
+    ///
+    /// If this returns `true`, block the `usage` of bandwidth.
+    fn should_limit_bandwidth(
+        &self,
+        ip: IpAddr,
+        bytes: Units,
+        label: &'static str,
+        now: Instant,
+    ) -> bool {
+        self.provide_ip_limiter(|this| this.should_limit_bandwidth_inner(ip, bytes, label, now))
+    }
+
+    /// Call to rate limit some custom (perhaps expensive) action per IP.
+    ///
+    /// If this returns `true`, block the `usage`.
+    fn should_limit_custom(&self, ip: IpAddr, usage: Units, now: Instant) -> bool {
+        self.provide_ip_limiter(|this| {
+            let entry = this.usage.entry(ip).or_insert_with(|| Usage::new(now));
+            entry
+                .custom_rate_limit
+                .should_limit_rate_with_now_and_usage(&this.custom_rate_limit, now, usage)
+        })
+    }
+
+    /// Set how long a DDoS incident will be be remembered.
+    ///
+    /// Default: 10m
+    fn set_ddos_memory(&self, ddos_memory: Duration) {
+        self.provide_ip_limiter(|this| {
+            this.ddos_memory = ddos_memory;
+        })
+    }
+
+    /// Call with `true` any time the host's CPU and/or RAM are nearly exausted,
+    /// then call with `false` when they are back to normal.
+    ///
+    /// This can trigger additional connection limiting before the connection
+    /// count hits the value set by [Self::set_total_connections_soft_limit].
+    ///
+    /// Default: `false`
+    fn set_compute_pressure(&self, compute_pressure: bool) {
+        self.provide_ip_limiter(|this| {
+            this.compute_pressure = compute_pressure;
+        });
+    }
+}
+
+/// A singleton implementation of [ProvideIpLimiter], analogous to the
+/// [std::alloc::System] allocator.
+#[derive(Copy, Clone, Default, Debug)]
+pub struct SystemIpLimiter;
+
+impl ProvideIpLimiter for SystemIpLimiter {
+    fn provide_ip_limiter<R>(&self, f: impl FnOnce(&mut IpLimiter) -> R) -> R {
+        static SINGLETON: Mutex<Option<IpLimiter>> = Mutex::new(None);
+        let mut opt = SINGLETON.lock().unwrap();
+        let this = opt.get_or_insert_with(|| Default::default());
+        // Yikes..
+        f(this)
+    }
+}
+
+/// A non-global implementation of [ProvideIpLimiter]. If you only have one instance,
+/// prefer [SystemIpLimiter].
+#[derive(Clone, Default, Debug)]
+pub struct ArcIpLimiter(Arc<Mutex<IpLimiter>>);
+
+impl ProvideIpLimiter for ArcIpLimiter {
+    fn provide_ip_limiter<R>(&self, f: impl FnOnce(&mut IpLimiter) -> R) -> R {
+        let mut this = self.0.lock().unwrap();
+        // Yikes..
+        f(&mut *this)
+    }
+}
 
 /// Limits connections and bandwidth based on client IP addresses.
 #[derive(Debug)]
@@ -57,16 +228,19 @@ enum WarningKind {
     },
 }
 
-/// Summary statistics for a given IP.
+/// Summary statistics for a given IP. They may be forgotten
+/// if there are no connections for an extended period.
 #[derive(Copy, Clone, Debug)]
 #[non_exhaustive]
 pub struct IpStats {
-    /// First connection (since the last time this IP was last garbage collected).
+    /// First connection.
     pub first: Instant,
     /// Number of outstanding [ConnectionPermit]s.
     pub connections: u32,
     /// Number of outstanding [ActiveSession]s.
     pub active_sessions: u32,
+    // Max concurrent [ActiveSession]s.
+    // pub max_active_sessions: u32,
     /// Last time this IP hit a hard limit.
     pub last_hard_limit: Option<Instant>,
 }
@@ -77,142 +251,13 @@ impl IpStats {
     }
 }
 
+impl Default for IpLimiter {
+    fn default() -> Self {
+        Self::new(500000, 1000000)
+    }
+}
+
 impl IpLimiter {
-    fn with_singleton<R>(f: impl FnOnce(&mut Self) -> R) -> R {
-        let mut opt = SINGLETON.lock().unwrap();
-        let this = opt.get_or_insert_with(|| Self::new(500000, 1000000));
-        // Yikes..
-        f(this)
-    }
-
-    /// Visit the [IpStats] for each tracked IP.
-    ///
-    /// The `visitor` should never block.
-    pub fn stats(mut visitor: impl FnMut(IpAddr, IpStats)) {
-        Self::with_singleton(|this| {
-            for (ip, v) in &this.usage {
-                visitor(*ip, v.stats);
-            }
-        });
-    }
-
-    /// Total number of outstanding [ConnectionPermit]s.
-    pub fn total_connections() -> u32 {
-        Self::with_singleton(|this| this.total_connections)
-    }
-
-    /// Set the bandwidth limits for the [IpLimiter] singleton.
-    ///
-    /// The `bytes_per_second` should be less than 1,000,000,000.
-    ///
-    /// Default: 500,000 bytes per second, 1,000,000 bytes burst.
-    pub fn set_bandwidth_limits(bytes_per_second: Units, bytes_burst: Units) {
-        Self::with_singleton(|this| {
-            this.connection_rate_limit =
-                RateLimiterProps::new_throughput(bytes_per_second, bytes_burst);
-        })
-    }
-
-    /// Set the properties of the custom rate limit corresponding to each IP.
-    pub fn set_custom_limits(props: RateLimiterProps) {
-        Self::with_singleton(|this| {
-            this.custom_rate_limit = props;
-        })
-    }
-
-    /// Set the 90th percentile number of [ConnectionPermit]s required per
-    /// [ActiveSession] of a median IP for the [IpLimiter] singleton.
-    ///
-    /// For example:
-    /// - if you have an HTTP/1-only server, set this to 4-6.
-    /// - if you have an HTTP/2 server with HTTP/1 WebSockets, set this to 2.
-    /// - if you have an HTTP/2 server (possibly with HTTP/2 WebSockets), set this to 1.
-    ///
-    /// Default: 1
-    pub fn set_connections_per_active_p90(connections_per_active_p90: u32) {
-        Self::with_singleton(|this| {
-            this.connections_per_active_p90 = connections_per_active_p90;
-        })
-    }
-
-    /// Set the 99th+ percentile number of [ConnectionPermit]s required per
-    /// [ActiveSession] of a median IP for the [IpLimiter] singleton.
-    ///
-    /// For example, if your server accepts HTTP/1 clients, set this to 6-12.
-    ///
-    /// Default: 6
-    pub fn set_connections_per_active_p99(connections_per_active_p99: u32) {
-        Self::with_singleton(|this| {
-            this.connections_per_active_p99 = connections_per_active_p99;
-        })
-    }
-
-    /// Set the soft maximum number of [ConnectionPermit]s, across all IP's,
-    /// before fewer new [ConnectionPermit]s are afforded to each IP.
-    ///
-    /// Default: 300
-    pub fn set_total_connections_soft_limit(total_connections_soft_limit: u32) {
-        Self::with_singleton(|this| {
-            this.total_connections_soft_limit = total_connections_soft_limit;
-        })
-    }
-
-    /// Set the hard limit on the number of [ConnectionPermit]s, across all IP's,
-    /// before all new [ConnectionPermit]s are denied.
-    ///
-    /// Default 1000.
-    pub fn set_total_connections_hard_limit(total_connections_hard_limit: u32) {
-        Self::with_singleton(|this| {
-            this.total_connections_hard_limit = total_connections_hard_limit;
-        })
-    }
-
-    /// Call when processing a message of `bytes` bytes from `ip` at `now`.
-    ///
-    /// If this returns `true`, block the `usage` of bandwidth.
-    pub fn should_limit_bandwidth(
-        ip: IpAddr,
-        bytes: Units,
-        label: &'static str,
-        now: Instant,
-    ) -> bool {
-        Self::with_singleton(|this| this.should_limit_bandwidth_inner(ip, bytes, label, now))
-    }
-
-    /// Call to rate limit some custom (perhaps expensive) action per IP.
-    ///
-    /// If this returns `true`, block the `usage`.
-    pub fn should_limit_custom(ip: IpAddr, usage: Units, now: Instant) -> bool {
-        Self::with_singleton(|this| {
-            let entry = this.usage.entry(ip).or_insert_with(|| Usage::new(now));
-            entry
-                .custom_rate_limit
-                .should_limit_rate_with_now_and_usage(&this.custom_rate_limit, now, usage)
-        })
-    }
-
-    /// Set how long a DDoS incident will be be remembered.
-    ///
-    /// Default: 10m
-    pub fn set_ddos_memory(ddos_memory: Duration) {
-        Self::with_singleton(|this| {
-            this.ddos_memory = ddos_memory;
-        })
-    }
-
-    /// Call with `true` any time the host's CPU and/or RAM are nearly exausted,
-    /// then call with `false` when they are back to normal.
-    ///
-    /// This can trigger additional connection limiting before the connection
-    /// count hits the value set by [Self::set_total_connections_soft_limit].
-    ///
-    /// Default: `false`
-    pub fn set_compute_pressure(compute_pressure: bool) {
-        Self::with_singleton(|this| {
-            this.compute_pressure = compute_pressure;
-        })
-    }
-
     pub(crate) fn should_limit_bandwidth_inner(
         &mut self,
         ip: IpAddr,
@@ -267,99 +312,113 @@ const WARNING_LIMIT: RateLimiterProps = RateLimiterProps::const_new(Duration::fr
 
 /// A RAII guard representing a permissible, long-lived connection (such as a TCP stream).
 #[derive(Debug)]
-pub struct ConnectionPermit(IpAddr);
+pub struct ConnectionPermit<P: ProvideIpLimiter = SystemIpLimiter>(IpAddr, P);
 
-impl ConnectionPermit {
+impl ConnectionPermit<SystemIpLimiter> {
     /// Check if a new connection is permissible. If this returns `Some`, accept the
     /// connection and keep the [ConnectionPermit] for its lifetime. If this returns
     /// `None`, reject the connection.
     ///
     /// The `label` should be something like `"TCP connection"`.
     pub fn new(ip: IpAddr, label: &'static str) -> Option<Self> {
-        let now = Instant::now();
-        IpLimiter::with_singleton(|limiter| {
-            if limiter.total_connections >= limiter.total_connections_hard_limit {
-                return None;
-            }
-            let entry = limiter.usage.entry(ip).or_insert_with(|| Usage::new(now));
-            // Represents overhead of starting a new connection.
-            let amount = 10000;
-            let should_rate_limit = entry
-                .connection_rate_limit
-                .should_limit_rate_with_now_and_usage(&limiter.connection_rate_limit, now, amount);
-
-            if should_rate_limit {
-                entry.stats.increment_hard_limited(now);
-                limiter.warn(
-                    Warning {
-                        label,
-                        ip,
-                        kind: WarningKind::Bandwidth { amount },
-                    },
-                    now,
-                );
-                return None;
-            }
-            let old = now.duration_since(entry.stats.first) > Duration::from_secs(60);
-            let soft_limit_reached = limiter.compute_pressure
-                || limiter.total_connections >= limiter.total_connections_soft_limit;
-            if soft_limit_reached {
-                limiter.last_soft_limit = Some(now);
-            }
-            let recent_global_soft_limit = limiter
-                .last_soft_limit
-                .filter(|&last| now.duration_since(last) < limiter.ddos_memory)
-                .is_some();
-            let recent_local_hard_limit = entry
-                .stats
-                .last_hard_limit
-                .filter(|&last| now.duration_since(last) < limiter.ddos_memory)
-                .is_some();
-            let enforce_soft_limit = (!old || recent_local_hard_limit) && recent_global_soft_limit;
-            let soft_limit =
-                (entry.stats.active_sessions + 1).saturating_mul(if enforce_soft_limit {
-                    limiter.connections_per_active_p90
-                } else {
-                    limiter.connections_per_active_p99
-                });
-            let hard_limit = if enforce_soft_limit {
-                soft_limit
-            } else {
-                soft_limit.saturating_add(limiter.connections_per_active_p90)
-            };
-            let hit_hard_limit = entry.stats.connections >= hard_limit;
-            if hit_hard_limit || (entry.stats.connections >= soft_limit && random()) {
-                if hit_hard_limit {
-                    entry.stats.increment_hard_limited(now);
-                }
-                let warning = Warning {
-                    ip,
-                    label,
-                    kind: WarningKind::ConnectionCount {
-                        connections: entry.stats.connections,
-                        active_sessions: entry.stats.active_sessions,
-                        limit: if hit_hard_limit {
-                            hard_limit
-                        } else {
-                            soft_limit
-                        },
-                        hard: hit_hard_limit,
-                    },
-                };
-                limiter.warn(warning, now);
-                None
-            } else {
-                entry.stats.connections += 1;
-                limiter.total_connections += 1;
-                Some(Self(ip))
-            }
-        })
+        Self::new_with(ip, label, SystemIpLimiter)
     }
 }
 
-impl Drop for ConnectionPermit {
+impl<P: ProvideIpLimiter> ConnectionPermit<P> {
+    /// Like [Self::new] but with any [ProvideIpLimiter] implementation.
+    pub fn new_with(ip: IpAddr, label: &'static str, provide: P) -> Option<Self> {
+        let now = Instant::now();
+        provide
+            .provide_ip_limiter(|limiter| {
+                if limiter.total_connections >= limiter.total_connections_hard_limit {
+                    return None;
+                }
+                let entry = limiter.usage.entry(ip).or_insert_with(|| Usage::new(now));
+                // Represents overhead of starting a new connection.
+                let amount = 10000;
+                let should_rate_limit = entry
+                    .connection_rate_limit
+                    .should_limit_rate_with_now_and_usage(
+                        &limiter.connection_rate_limit,
+                        now,
+                        amount,
+                    );
+
+                if should_rate_limit {
+                    entry.stats.increment_hard_limited(now);
+                    limiter.warn(
+                        Warning {
+                            label,
+                            ip,
+                            kind: WarningKind::Bandwidth { amount },
+                        },
+                        now,
+                    );
+                    return None;
+                }
+                let old = now.duration_since(entry.stats.first) > Duration::from_secs(60);
+                let soft_limit_reached = limiter.compute_pressure
+                    || limiter.total_connections >= limiter.total_connections_soft_limit;
+                if soft_limit_reached {
+                    limiter.last_soft_limit = Some(now);
+                }
+                let recent_global_soft_limit = limiter
+                    .last_soft_limit
+                    .filter(|&last| now.duration_since(last) < limiter.ddos_memory)
+                    .is_some();
+                let recent_local_hard_limit = entry
+                    .stats
+                    .last_hard_limit
+                    .filter(|&last| now.duration_since(last) < limiter.ddos_memory)
+                    .is_some();
+                let enforce_soft_limit =
+                    (!old || recent_local_hard_limit) && recent_global_soft_limit;
+                let soft_limit =
+                    (entry.stats.active_sessions + 1).saturating_mul(if enforce_soft_limit {
+                        limiter.connections_per_active_p90
+                    } else {
+                        limiter.connections_per_active_p99
+                    });
+                let hard_limit = if enforce_soft_limit {
+                    soft_limit
+                } else {
+                    soft_limit.saturating_add(limiter.connections_per_active_p90)
+                };
+                let hit_hard_limit = entry.stats.connections >= hard_limit;
+                if hit_hard_limit || (entry.stats.connections >= soft_limit && random()) {
+                    if hit_hard_limit {
+                        entry.stats.increment_hard_limited(now);
+                    }
+                    let warning = Warning {
+                        ip,
+                        label,
+                        kind: WarningKind::ConnectionCount {
+                            connections: entry.stats.connections,
+                            active_sessions: entry.stats.active_sessions,
+                            limit: if hit_hard_limit {
+                                hard_limit
+                            } else {
+                                soft_limit
+                            },
+                            hard: hit_hard_limit,
+                        },
+                    };
+                    limiter.warn(warning, now);
+                    None
+                } else {
+                    entry.stats.connections += 1;
+                    limiter.total_connections += 1;
+                    Some(ip)
+                }
+            })
+            .map(|ip| Self(ip, provide))
+    }
+}
+
+impl<P: ProvideIpLimiter> Drop for ConnectionPermit<P> {
     fn drop(&mut self) {
-        IpLimiter::with_singleton(|limiter| {
+        self.1.provide_ip_limiter(|limiter| {
             if let Some(usage) = limiter.usage.get_mut(&self.0) {
                 debug_assert!(usage.stats.connections > 0);
                 usage.stats.connections = usage.stats.connections.saturating_sub(1);
@@ -376,26 +435,33 @@ impl Drop for ConnectionPermit {
 /// A RAII guard representing a connection with meaningful activity taking place,
 /// such as an authenticated WebSocket on top of a TCP stream.
 #[derive(Debug)]
-pub struct ActiveSession(IpAddr);
+pub struct ActiveSession<P: ProvideIpLimiter = SystemIpLimiter>(IpAddr, P);
 
-impl ActiveSession {
+impl ActiveSession<SystemIpLimiter> {
     /// Keep the [ActiveSession] as long as meaningful activity is taking place.
     pub fn new(addr: IpAddr) -> Self {
-        IpLimiter::with_singleton(|limiter| {
+        Self::new_with(addr, SystemIpLimiter)
+    }
+}
+
+impl<P: ProvideIpLimiter> ActiveSession<P> {
+    /// Like [Self::new] but with any [ProvideIpLimiter] implementation.
+    pub fn new_with(addr: IpAddr, provide: P) -> Self {
+        provide.provide_ip_limiter(|limiter| {
             limiter
                 .usage
                 .entry(addr)
                 .or_insert_with(|| Usage::new(Instant::now()))
                 .stats
                 .active_sessions += 1;
-            Self(addr)
-        })
+        });
+        Self(addr, provide)
     }
 }
 
-impl Drop for ActiveSession {
+impl<P: ProvideIpLimiter> Drop for ActiveSession<P> {
     fn drop(&mut self) {
-        IpLimiter::with_singleton(|limiter| {
+        self.1.provide_ip_limiter(|limiter| {
             if let Some(usage) = limiter.usage.get_mut(&self.0) {
                 debug_assert!(usage.stats.active_sessions > 0);
                 usage.stats.active_sessions = usage.stats.active_sessions.saturating_sub(1);

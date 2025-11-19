@@ -1,8 +1,7 @@
 //! `axum` + `axum_server` DoS mitigation utilities.
 
+use super::ip_limiter::{ConnectionPermit, ProvideIpLimiter, SystemIpLimiter};
 use crate::tokio_net::nodelay_keepalive;
-
-use super::ip_limiter::ConnectionPermit;
 use axum::extract::Request;
 use axum_server::accept::Accept;
 use std::future::Future;
@@ -22,12 +21,19 @@ use tower::Service;
 ///   activated using a [KillSwitch] extension in an [axum::Router]
 ///   handler.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct AxumServerAcceptor<S, I>(I, PhantomData<S>);
+pub struct AxumServerAcceptor<S, I, P = SystemIpLimiter>(I, PhantomData<S>, P);
 
-impl<S, I> AxumServerAcceptor<S, I> {
+impl<S, I> AxumServerAcceptor<S, I, SystemIpLimiter> {
     /// Wrap an `axum_server` acceptor.
     pub fn new(inner: I) -> Self {
-        Self(inner, PhantomData)
+        Self::new_with(inner, SystemIpLimiter)
+    }
+}
+
+impl<S, I, P: ProvideIpLimiter> AxumServerAcceptor<S, I, P> {
+    /// Like [Self::new] but with any [ProvideIpLimiter] implementation.
+    pub fn new_with(inner: I, provide: P) -> Self {
+        Self(inner, PhantomData, provide)
     }
 }
 
@@ -56,19 +62,24 @@ impl<F: Future> Future for FutureOrImmediate<F> {
     }
 }
 
-impl<S, I: Accept<KillSwitchStream<TcpStream>, AddExtension<S, KillSwitch>>>
-    axum_server::accept::Accept<TcpStream, S> for AxumServerAcceptor<S, I>
+impl<
+        S,
+        P: ProvideIpLimiter,
+        I: Accept<KillSwitchStream<TcpStream, P>, AddExtension<S, KillSwitch>>,
+    > axum_server::accept::Accept<TcpStream, S> for AxumServerAcceptor<S, I, P>
 {
     type Future = FutureOrImmediate<I::Future>;
-    type Service = <I as Accept<KillSwitchStream<TcpStream>, AddExtension<S, KillSwitch>>>::Service;
-    type Stream = <I as Accept<KillSwitchStream<TcpStream>, AddExtension<S, KillSwitch>>>::Stream;
+    type Service =
+        <I as Accept<KillSwitchStream<TcpStream, P>, AddExtension<S, KillSwitch>>>::Service;
+    type Stream =
+        <I as Accept<KillSwitchStream<TcpStream, P>, AddExtension<S, KillSwitch>>>::Stream;
 
     fn accept(&self, stream: TcpStream, service: S) -> FutureOrImmediate<I::Future> {
         let Some(_permit) = stream
             .peer_addr()
             .ok()
             .map(|s| s.ip())
-            .and_then(|ip| ConnectionPermit::new(ip, "TCP connection"))
+            .and_then(|ip| ConnectionPermit::new_with(ip, "TCP connection", self.2.clone()))
         else {
             return FutureOrImmediate::Immediate(Some(Err(io::Error::from(
                 ErrorKind::ConnectionRefused,
@@ -137,12 +148,12 @@ where
 
 /// A stream that may be killed via a channel.
 #[pin_project::pin_project]
-pub struct KillSwitchStream<S> {
+pub struct KillSwitchStream<S, P: ProvideIpLimiter = SystemIpLimiter> {
     #[pin]
     stream: S,
     #[pin]
     killed: mpsc::Receiver<()>,
-    _permit: ConnectionPermit,
+    _permit: ConnectionPermit<P>,
 }
 
 #[inline(always)]
@@ -156,7 +167,7 @@ fn check_killed(mut killed: Pin<&mut mpsc::Receiver<()>>, cx: &mut Context<'_>) 
     }
 }
 
-impl<S: AsyncRead> AsyncRead for KillSwitchStream<S> {
+impl<S: AsyncRead, P: ProvideIpLimiter> AsyncRead for KillSwitchStream<S, P> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -168,7 +179,7 @@ impl<S: AsyncRead> AsyncRead for KillSwitchStream<S> {
     }
 }
 
-impl<S: AsyncWrite> AsyncWrite for KillSwitchStream<S> {
+impl<S: AsyncWrite, P: ProvideIpLimiter> AsyncWrite for KillSwitchStream<S, P> {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,

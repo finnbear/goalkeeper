@@ -9,7 +9,7 @@ use axum_server::{accept::Accept, Server};
 use futures_util::SinkExt;
 use goalkeeper::{
     axum::AxumServerAcceptor,
-    ip_limiter::{ActiveSession, IpLimiter},
+    ip_limiter::{ActiveSession, ProvideIpLimiter, SystemIpLimiter},
     rate_limiter::RateLimiterProps,
 };
 use hyper::StatusCode;
@@ -28,15 +28,15 @@ pub async fn main() {
 
     info!("you must run this example on Linux, as root");
 
-    IpLimiter::set_custom_limits(RateLimiterProps::new(Duration::from_secs(1), 3));
-    IpLimiter::set_total_connections_soft_limit(16);
+    SystemIpLimiter.set_custom_limits(RateLimiterProps::new(Duration::from_secs(1), 3));
+    SystemIpLimiter.set_total_connections_soft_limit(16);
 
     let router = Router::new().route(
         "/ws",
         get(
             move |addr: ConnectInfo<SocketAddr>, websocket: WebSocketUpgrade| async move {
                 let ip = addr.ip();
-                if IpLimiter::should_limit_custom(ip, 1, Instant::now()) {
+                if SystemIpLimiter.should_limit_custom(ip, 1, Instant::now()) {
                     log::trace!("refusing {ip} due to too many WebSockets");
                     return Response::builder()
                         .status(StatusCode::TOO_MANY_REQUESTS)
@@ -60,7 +60,7 @@ pub async fn main() {
                                         Message::Text(t) => t.len(),
                                         _ => 100,
                                     };
-                                    if IpLimiter::should_limit_bandwidth(
+                                    if SystemIpLimiter.should_limit_bandwidth(
                                         ip,
                                         len as u32,
                                         "WS message",
@@ -181,7 +181,7 @@ pub async fn main() {
             let mut ips = 0u32;
             let mut connections = 0;
             let mut active_sessions = 0;
-            IpLimiter::stats(|_, s| {
+            SystemIpLimiter.stats(|_, s| {
                 ips += 1;
                 connections += s.connections;
                 active_sessions += s.active_sessions;
