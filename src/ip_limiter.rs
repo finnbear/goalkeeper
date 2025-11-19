@@ -162,7 +162,7 @@ impl ProvideIpLimiter for SystemIpLimiter {
     fn provide_ip_limiter<R>(&self, f: impl FnOnce(&mut IpLimiter) -> R) -> R {
         static SINGLETON: Mutex<Option<IpLimiter>> = Mutex::new(None);
         let mut opt = SINGLETON.lock().unwrap();
-        let this = opt.get_or_insert_with(|| Default::default());
+        let this = opt.get_or_insert_with(Default::default);
         // Yikes..
         f(this)
     }
@@ -177,7 +177,7 @@ impl ProvideIpLimiter for ArcIpLimiter {
     fn provide_ip_limiter<R>(&self, f: impl FnOnce(&mut IpLimiter) -> R) -> R {
         let mut this = self.0.lock().unwrap();
         // Yikes..
-        f(&mut *this)
+        f(&mut this)
     }
 }
 
