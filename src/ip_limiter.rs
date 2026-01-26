@@ -87,7 +87,7 @@ pub trait ProvideIpLimiter: Clone {
     /// Set the soft maximum number of [ConnectionPermit]s, across all IP's,
     /// before fewer new [ConnectionPermit]s are afforded to each IP.
     ///
-    /// Default: 300
+    /// Default: 400
     fn set_total_connections_soft_limit(&self, total_connections_soft_limit: u32) {
         self.provide_ip_limiter(|this| {
             this.total_connections_soft_limit = total_connections_soft_limit;
@@ -122,7 +122,10 @@ pub trait ProvideIpLimiter: Clone {
     /// If this returns `true`, block the `usage`.
     fn should_limit_custom(&self, ip: IpAddr, usage: Units, now: Instant) -> bool {
         self.provide_ip_limiter(|this| {
-            let entry = this.usage.entry(ip).or_insert_with(|| Usage::new(now));
+            let entry = this
+                .usage
+                .entry(ip)
+                .or_insert_with(|| Usage::new(now, &mut this.new_ip_counter));
             entry
                 .custom_rate_limit
                 .should_limit_rate_with_now_and_usage(&this.custom_rate_limit, now, usage)
@@ -136,6 +139,11 @@ pub trait ProvideIpLimiter: Clone {
         self.provide_ip_limiter(|this| {
             this.ddos_memory = ddos_memory;
         })
+    }
+
+    /// Gets the value set by [`Self::set_compute_pressure`].
+    fn compute_pressure(&self) -> bool {
+        self.provide_ip_limiter(|this| this.compute_pressure)
     }
 
     /// Call with `true` any time the host's CPU and/or RAM are nearly exausted,
@@ -197,6 +205,7 @@ pub struct IpLimiter {
     last_soft_limit: Option<Instant>,
     ddos_memory: Duration,
     compute_pressure: bool,
+    new_ip_counter: u32,
 }
 
 #[derive(Debug)]
@@ -205,6 +214,7 @@ struct WarningSet {
     small_full: bool,
     bandwidth: FxHashMap<IpAddr, u32>,
     connections: FxHashMap<IpAddr, u32>,
+    granted_rare_exemptions: u32,
 }
 
 #[derive(Debug)]
@@ -223,6 +233,7 @@ enum WarningKind {
         connections: u32,
         active_sessions: u32,
         limit: u32,
+        granted_rare_exemption: bool,
     },
 }
 
@@ -283,10 +294,13 @@ struct Usage {
     connection_rate_limit: RateLimiterState,
     custom_rate_limit: RateLimiterState,
     stats: IpStats,
+    /// IP is in the top ~1% (eligible for p99 limits).
+    granted_rare_exemption: bool,
 }
 
 impl Usage {
-    fn new(now: Instant) -> Self {
+    fn new(now: Instant, new_ip_counter: &mut u32) -> Self {
+        *new_ip_counter = new_ip_counter.saturating_add(1);
         Self {
             connection_rate_limit: RateLimiterState {
                 until: now,
@@ -302,6 +316,7 @@ impl Usage {
                 active_sessions: 0,
                 last_limit: None,
             },
+            granted_rare_exemption: false,
         }
     }
 }
@@ -329,10 +344,26 @@ impl<P: ProvideIpLimiter> ConnectionPermit<P> {
         let now = Instant::now();
         provide
             .provide_ip_limiter(|limiter| {
+                let entry = limiter
+                    .usage
+                    .entry(ip)
+                    .or_insert_with(|| Usage::new(now, &mut limiter.new_ip_counter));
+
                 if limiter.total_connections >= limiter.total_connections_hard_limit {
+                    let warning = Warning {
+                        ip,
+                        label,
+                        kind: WarningKind::ConnectionCount {
+                            connections: entry.stats.connections,
+                            active_sessions: entry.stats.active_sessions,
+                            limit: entry.stats.connections,
+                            granted_rare_exemption: false,
+                        },
+                    };
+                    limiter.warn(warning, now);
                     return None;
                 }
-                let entry = limiter.usage.entry(ip).or_insert_with(|| Usage::new(now));
+
                 // Represents overhead of starting a new connection.
                 let amount = 10000;
                 let should_rate_limit = entry
@@ -371,8 +402,20 @@ impl<P: ProvideIpLimiter> ConnectionPermit<P> {
                     .filter(|&last| now.duration_since(last) < limiter.ddos_memory)
                     .is_some();
                 let strict_limit = (!old || recent_local_limit) && recent_global_soft_limit;
+                let mut just_granted_rare_exemption = false;
+                let granted_rare_exemption = if entry.granted_rare_exemption {
+                    true
+                } else if strict_limit && !recent_local_limit && limiter.new_ip_counter >= 100 {
+                    limiter.new_ip_counter =
+                        (limiter.new_ip_counter - 100).min(limiter.new_ip_counter / 2);
+                    entry.granted_rare_exemption = true;
+                    just_granted_rare_exemption = true;
+                    true
+                } else {
+                    false
+                };
                 let limit = (entry.stats.active_sessions + 1 + (!strict_limit) as u32)
-                    .saturating_mul(if strict_limit {
+                    .saturating_mul(if strict_limit && !granted_rare_exemption {
                         limiter.connections_per_active_p90
                     } else {
                         limiter.connections_per_active_p99
@@ -386,6 +429,7 @@ impl<P: ProvideIpLimiter> ConnectionPermit<P> {
                             connections: entry.stats.connections,
                             active_sessions: entry.stats.active_sessions,
                             limit,
+                            granted_rare_exemption: false,
                         },
                     };
                     limiter.warn(warning, now);
@@ -393,6 +437,21 @@ impl<P: ProvideIpLimiter> ConnectionPermit<P> {
                 } else {
                     entry.stats.connections += 1;
                     limiter.total_connections += 1;
+
+                    if just_granted_rare_exemption {
+                        let warning = Warning {
+                            ip,
+                            label,
+                            kind: WarningKind::ConnectionCount {
+                                connections: entry.stats.connections,
+                                active_sessions: entry.stats.active_sessions,
+                                limit,
+                                granted_rare_exemption: true,
+                            },
+                        };
+                        limiter.warn(warning, now);
+                    }
+
                     Some(ip)
                 }
             })
@@ -435,7 +494,7 @@ impl<P: ProvideIpLimiter> ActiveSession<P> {
             limiter
                 .usage
                 .entry(addr)
-                .or_insert_with(|| Usage::new(Instant::now()))
+                .or_insert_with(|| Usage::new(Instant::now(), &mut limiter.new_ip_counter))
                 .stats
                 .active_sessions += 1;
         });
@@ -470,15 +529,17 @@ impl IpLimiter {
                 small_full: false,
                 bandwidth: Default::default(),
                 connections: Default::default(),
+                granted_rare_exemptions: 0,
             },
             connections_per_active_p90: 1,
             connections_per_active_p99: 6,
             total_connections: 0,
-            total_connections_soft_limit: 300,
+            total_connections_soft_limit: 400,
             total_connections_hard_limit: 1000,
             last_soft_limit: None,
             ddos_memory: Duration::from_secs(5 * 60),
             compute_pressure: false,
+            new_ip_counter: 200,
         }
     }
 
@@ -493,9 +554,17 @@ impl IpLimiter {
                         let entry = self.pending.bandwidth.entry(warning.ip).or_default();
                         *entry = entry.saturating_add(amount);
                     }
-                    WarningKind::ConnectionCount { .. } => {
-                        let entry = self.pending.connections.entry(warning.ip).or_default();
-                        *entry = entry.saturating_add(1);
+                    WarningKind::ConnectionCount {
+                        granted_rare_exemption,
+                        ..
+                    } => {
+                        if granted_rare_exemption {
+                            self.pending.granted_rare_exemptions =
+                                self.pending.granted_rare_exemptions.saturating_add(1);
+                        } else {
+                            let entry = self.pending.connections.entry(warning.ip).or_default();
+                            *entry = entry.saturating_add(1);
+                        }
                     }
                 }
             }
@@ -518,8 +587,14 @@ impl IpLimiter {
                         connections,
                         active_sessions,
                         limit,
+                        granted_rare_exemption,
                     } => {
-                        warn!("{ip} hit conn limit {limit} with {label} ({active_sessions} act, {connections} tot)");
+                        let event = if granted_rare_exemption {
+                            "granted special"
+                        } else {
+                            "hit"
+                        };
+                        warn!("{ip} {event} conn limit {limit} with {label} ({active_sessions} act, {connections})");
                     }
                 }
             }
@@ -553,13 +628,18 @@ impl IpLimiter {
             );
             self.pending.bandwidth.clear();
         }
-        if let Some(sample) = self.pending.bandwidth.keys().next() {
+        if let Some(sample) = self.pending.connections.keys().next() {
             let attempts = self.pending.connections.values().copied().sum::<u32>();
             warn!(
-                "{} IP's, e.g. {sample}, hit conn limit with {attempts} attempts",
-                self.pending.connections.len()
+                "{} IP's, e.g. {sample}, hit conn limit with {attempts} attempts ({} exempt. granted)",
+                self.pending.connections.len(),
+                self.pending.granted_rare_exemptions,
             );
             self.pending.connections.clear();
+            self.pending.granted_rare_exemptions = 0;
+        } else if self.pending.granted_rare_exemptions > 0 {
+            warn!("{} exempt. granted", self.pending.granted_rare_exemptions);
+            self.pending.granted_rare_exemptions = 0;
         }
 
         self.pending.small_full = false;
@@ -573,7 +653,10 @@ impl IpLimiter {
         bytes: Units,
         now: Instant,
     ) -> bool {
-        let entry = self.usage.entry(ip).or_insert_with(|| Usage::new(now));
+        let entry = self
+            .usage
+            .entry(ip)
+            .or_insert_with(|| Usage::new(now, &mut self.new_ip_counter));
         let should_limit_rate = entry
             .connection_rate_limit
             .should_limit_rate_with_now_and_usage(&self.connection_rate_limit, now, bytes);

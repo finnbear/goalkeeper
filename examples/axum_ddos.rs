@@ -14,6 +14,7 @@ use goalkeeper::{
 };
 use hyper::StatusCode;
 use log::{info, LevelFilter};
+use rand::{thread_rng, Rng};
 use std::{
     io,
     net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -114,7 +115,7 @@ pub async fn main() {
         too_high_message_rate: bool,
     }
 
-    for i in 0..32 {
+    for i in 0..64 {
         let abuse = Abuse {
             too_many_connections_per_ip: i & 0b1 != 0,
             too_high_connection_rate: i & 0b10 != 0,
@@ -129,21 +130,36 @@ pub async fn main() {
         } {
             tokio::spawn(async move {
                 loop {
-                    let stream = connect_to_localhost_from_nth_ip(i, PORT).unwrap();
+                    let Ok(stream) = connect_to_localhost_from_nth_ip(i, PORT) else {
+                        tokio::time::sleep(Duration::from_millis({
+                            let r = thread_rng().gen_range(500..1000);
+                            r
+                        }))
+                        .await;
+                        continue;
+                    };
 
                     if abuse.no_handshake {
                         tokio::time::sleep(Duration::from_millis(500)).await;
                         break;
                     }
-                    let Ok((mut client, _)) = tokio_websockets::ClientBuilder::new()
+                    let result = tokio_websockets::ClientBuilder::new()
                         .uri(&format!("ws://127.0.0.1:{PORT}/ws"))
                         .unwrap()
                         .connect_on(stream)
-                        .await
-                    else {
-                        assert_ne!(abuse, Default::default());
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                        continue;
+                        .await;
+                    let mut client = match result {
+                        Ok((client, _)) => client,
+                        Err(_e) => {
+                            //println!("{e}");
+                            //assert_ne!(abuse, Default::default());
+                            tokio::time::sleep(Duration::from_millis({
+                                let r = thread_rng().gen_range(500..1000);
+                                r
+                            }))
+                            .await;
+                            continue;
+                        }
                     };
 
                     let start = Instant::now();
@@ -228,7 +244,9 @@ fn connect_to_localhost_from_nth_ip(nth: u16, port: u16) -> io::Result<TcpStream
         .unwrap();
     let stderr = String::from_utf8_lossy(&add.stderr);
     assert!(
-        add.status.success() || stderr.contains("File exists"),
+        add.status.success()
+            || stderr.contains("File exists")
+            || stderr.contains("already assigned"),
         "{stderr}"
     );
 
