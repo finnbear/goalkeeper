@@ -17,11 +17,13 @@ axum-server = { version = "0.7.1", optional = true }
 tokio = { version = "1.39.3", features = ["net"], default-features = false, optional = true }
 tower = { version = "0.4", optional = true }
 pin-project = { version = "1.1", optional = true }
+actix-web = { version = "4.12.1", optional = true }
+futures-util = { version = "0.3.31", optional = true }
+actix-http = { version = "3.11.2", optional = true }
 
 [dev-dependencies]
 axum = { version = "=0.8.1", features = ["ws"], default-features = false }
 env_logger = "0.11.8"
-futures-util = "0.3.31"
 hyper = { version = "=1.6.0" }
 hyper-util = { version = "=0.1.7", features = [ "tokio" ] }
 rand = "0.8.4"
@@ -32,6 +34,7 @@ tokio-websockets = { version = "0.12.3", features = ["client", "rand", "ring"], 
 default = []
 tokio = ["dep:tokio", "socket2"]
 axum = ["dep:axum", "axum-server", "tokio", "tower", "pin-project"]
+actix = ["dep:actix-web", "actix-http", "tokio", "futures-util"]
 
 [[example]]
 name = "axum_ddos"

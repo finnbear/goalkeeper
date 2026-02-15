@@ -13,7 +13,7 @@ DoS and DDoS protection library.
 - [x] Connection limiting
 - [x] Bandwidth limiting
 - [x] Optional `TCP_KEEPALIVE` and `TCP_NODELAY` helper function for `tokio::net::TcpStream`
-- [x] Optional `axum` and `axum_server` support
+- [x] Optional `axum`, `axum_server`, and `actix` support
 - [x] Logging
 - [ ] `nftables` firewall configuration
 - [ ] OS network stack hardening

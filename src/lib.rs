@@ -3,6 +3,8 @@
 
 //! DoS and DDoS mitigation utilities.
 
+#[cfg(feature = "actix")]
+pub mod actix;
 #[cfg(feature = "axum")]
 pub mod axum;
 pub mod ip_limiter;
