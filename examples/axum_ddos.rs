@@ -87,10 +87,10 @@ pub async fn main() {
     // If you had separate HTTP and HTTPS servers, you could use a trait like this
     // to configure both.
     trait ConfigureExt<S, A> {
-        fn configure(self) -> Server<AxumServerAcceptor<S, A>>;
+        fn configure(self) -> Server<SocketAddr, AxumServerAcceptor<S, A>>;
     }
-    impl<S, A: Accept<TcpStream, S>> ConfigureExt<S, A> for Server<A> {
-        fn configure(mut self) -> Server<AxumServerAcceptor<S, A>> {
+    impl<S, A: Accept<TcpStream, S>> ConfigureExt<S, A> for Server<SocketAddr, A> {
+        fn configure(mut self) -> Server<SocketAddr, AxumServerAcceptor<S, A>> {
             let http = self.http_builder();
             http.http1()
                 .timer(hyper_util::rt::TokioTimer::new())
