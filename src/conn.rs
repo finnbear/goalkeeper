@@ -303,8 +303,8 @@ impl<P: ProvideGoalkeeper> Conn<P> {
         let index = dir as usize;
         // Spends the lease. Saturating, since a single write may overshoot what
         // was left of it, bounded by that one write.
-        let _ = self.0.credit[index].fetch_update(Ordering::Relaxed, Ordering::Relaxed, |credit| {
-            Some(credit.saturating_sub(bytes))
+        self.0.credit[index].update(Ordering::Relaxed, Ordering::Relaxed, |credit| {
+            credit.saturating_sub(bytes)
         });
         let pending = self.0.pending[index].fetch_add(bytes, Ordering::Relaxed) + bytes;
         if pending >= FLUSH_BYTES || self.0.credit[index].load(Ordering::Relaxed) == 0 {
