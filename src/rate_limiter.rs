@@ -39,10 +39,22 @@ impl Debug for RateLimiterState {
 }
 
 /// The (sharable) properties of a rate limiter.
-#[derive(Debug)]
+#[derive(Copy, Clone, Debug)]
 pub struct RateLimiterProps {
     rate_limit: Duration,
     pub(crate) burst: Units,
+}
+
+impl RateLimiterProps {
+    /// How much may be spent in a burst once the steady rate is exhausted.
+    pub fn burst(&self) -> Units {
+        self.burst
+    }
+
+    /// Seconds per unit of the steady rate.
+    pub fn rate_limit(&self) -> Duration {
+        self.rate_limit
+    }
 }
 
 impl RateLimiterState {
@@ -82,13 +94,12 @@ impl RateLimiterState {
             false
         };
 
-        if ok {
-            if let Some(instant) = self
+        if ok
+            && let Some(instant) = self
                 .until
                 .checked_add(props.rate_limit.saturating_mul(usage))
-            {
-                self.until = instant.max(now);
-            }
+        {
+            self.until = instant.max(now);
         }
 
         !ok
