@@ -647,7 +647,9 @@ impl Shared {
                 return None;
             }
             let best = bits.trailing_zeros() as usize;
-            let level = self.aged_choice(inner, best, now, config).unwrap_or(best);
+            let level = self
+                .aged_choice(inner, bits, best, now, config)
+                .unwrap_or(best);
             let aged = level != best;
 
             let Some(job) = inner.queues[level].pop_front() else {
@@ -757,13 +759,28 @@ impl Shared {
     /// [`Config::aging_base`]. Occupied rather than one integer, since the
     /// ladder is sparse and stepping by number would take a stranger two
     /// hundred doublings to reach the top.
+    /// Whether a worse level has waited long enough to be served before `best`.
+    ///
+    /// `bits` is the occupancy bitmap the caller already read, and doing the
+    /// whole search against it rather than against the queues is what keeps
+    /// this off the dispatch path's critical cost. Empty levels are never
+    /// looked at, and "how many occupied levels sit between these two" is a
+    /// mask and a popcount rather than a scan.
     fn aged_choice(
         &self,
         inner: &Inner,
+        bits: u32,
         best: usize,
         now: Instant,
         config: &Config,
     ) -> Option<usize> {
+        // Everything worse than `best`. Nothing there means nothing to promote,
+        // which is the common case: one level occupied, or the best one is the
+        // only one with work.
+        let mut worse = bits & !((1u32 << (best + 1)) - 1);
+        if worse == 0 {
+            return None;
+        }
         if inner.override_spent >= config.window.mul_f32(config.override_budget) {
             return None;
         }
@@ -772,8 +789,11 @@ impl Shared {
 
         let mut choice = None;
         let mut choice_slack = 0u32;
-        for level in (best + 1)..Priority::LEVELS {
+        while worse != 0 {
+            let level = worse.trailing_zeros() as usize;
+            worse &= worse - 1;
             let Some(head) = inner.queues[level].front() else {
+                debug_assert!(false, "bitmap claimed level {level} was occupied");
                 continue;
             };
             let waited =
@@ -782,9 +802,9 @@ impl Shared {
                 continue;
             }
             let promotions = (waited / base).ilog2() + 1;
-            let occupied_above = (best..level)
-                .filter(|l| !inner.queues[*l].is_empty())
-                .count() as u32;
+            // The occupied levels in `best..level`, straight off the bitmap.
+            let between = ((1u32 << level) - 1) & !((1u32 << best) - 1);
+            let occupied_above = (bits & between).count_ones();
             if occupied_above > 0 && promotions >= occupied_above {
                 let slack = promotions - occupied_above;
                 if choice.is_none() || slack > choice_slack {
