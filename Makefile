@@ -1,3 +1,11 @@
-axum_ddos_example:
-	cargo build --example axum_ddos --features axum
-	sudo ./target/debug/examples/axum_ddos
+.PHONY: ddos test lint
+
+ddos:
+	cargo run --example ddos --features web_socket
+
+test:
+	cargo test --all-features
+
+lint:
+	cargo fmt --check
+	cargo clippy --all-targets --all-features

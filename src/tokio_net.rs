@@ -6,8 +6,6 @@
 //! can keep the portable path when they do not.
 
 use log::error;
-#[cfg(feature = "http")]
-use socket2::{SockRef, TcpKeepalive};
 use std::time::Duration;
 use tokio::net::TcpStream;
 
@@ -145,21 +143,7 @@ pub fn nodelay_keepalive(stream: &TcpStream, seconds: u64, retries: u32) {
     if let Err(e) = stream.set_nodelay(true) {
         error!("failed to set TCP nodelay: {e}");
     }
-
-    let sock_ref = SockRef::from(&stream);
-    #[cfg_attr(windows, allow(unused_mut))]
-    let mut params = TcpKeepalive::new()
-        .with_time(Duration::from_secs(seconds))
-        .with_interval(Duration::from_secs(seconds));
-    #[cfg(windows)]
-    {
-        let _ = retries;
-    }
-    #[cfg(not(windows))]
-    {
-        params = params.with_retries(retries);
-    }
-    if let Err(e) = sock_ref.set_tcp_keepalive(&params) {
+    if let Err(e) = crate::tcp::keepalive(stream, Duration::from_secs(seconds), retries) {
         error!("failed to set TCP keepalive: {e}");
     }
 }

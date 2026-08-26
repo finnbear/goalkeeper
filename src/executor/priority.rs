@@ -12,6 +12,7 @@
 //! variant of its own and should inherit with [`SharedPriority::depend_on`]:
 //! its correct priority is the best of whatever depends on it.
 
+use crate::executor::Census;
 use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -75,6 +76,10 @@ impl Priority {
     const NEW: u8 = 1 + UserPriority::COUNT as u8;
 
     /// The dense index used by the executor's queues and bitmap.
+    ///
+    /// A jump table over a handful of variants, on the path taken for every
+    /// enqueue and every dispatch.
+    #[inline(always)]
     pub(crate) const fn level(self) -> u8 {
         match self {
             Self::Main => 0,
@@ -86,6 +91,7 @@ impl Priority {
 
     /// Inverse of [`Self::level`]. Saturates rather than panicking, since it is
     /// only reached from diagnostics.
+    #[inline(always)]
     pub(crate) const fn from_level(level: u8) -> Self {
         // Not a `match`: a pattern cannot be written in terms of a constant
         // range, and the user range's end moves with `UserPriority::COUNT`.
@@ -181,6 +187,25 @@ struct Inner {
     /// Priorities this one boosts, so a change here propagates to them. See
     /// [`SharedPriority::depend_on`].
     links: Mutex<Vec<Link>>,
+    /// This handle's live tasks and where the executor has them counted.
+    ///
+    /// Behind the same lock as the level move it accompanies, so the count and
+    /// [`Self::effective`] cannot disagree about where these tasks are.
+    census: Mutex<CensusState>,
+}
+
+/// One handle's contribution to [`Census`].
+#[derive(Debug, Default)]
+struct CensusState {
+    /// The executor's counters, learned when the first task is spawned against
+    /// this handle. [`None`] for a handle nothing has been spawned against,
+    /// which is every handle a caller builds and never uses.
+    census: Option<Arc<Census>>,
+    /// Live tasks holding this handle.
+    tasks: usize,
+    /// The level those tasks are counted at, which trails
+    /// [`Inner::effective`] only within a critical section.
+    level: u8,
 }
 
 /// A live edge from a dependent to what it depends on.
@@ -203,22 +228,61 @@ impl SharedPriority {
             effective: AtomicU8::new(level),
             boosts: Mutex::new(Vec::new()),
             links: Mutex::new(Vec::new()),
+            census: Mutex::new(CensusState {
+                census: None,
+                tasks: 0,
+                level,
+            }),
         }))
     }
 
+    /// Counts one more task against this handle, in `census`.
+    ///
+    /// Idempotent about which census: the first spawn adopts one and later
+    /// spawns join it, so a handle shared across two executors counts in the
+    /// one that saw it first rather than in both.
+    pub(crate) fn census_join(&self, census: &Arc<Census>) {
+        let mut state = self.0.census.lock().unwrap();
+        // Read under the lock, so a level moving concurrently either counts
+        // this task at the old level and then moves it, or at the new one.
+        let level = self.0.effective.load(Ordering::Relaxed);
+        let (counted_at, tasks) = (state.level, state.tasks);
+        let census = state.census.get_or_insert_with(|| Arc::clone(census));
+        // A no-op while every level change goes through `reconcile`, which
+        // keeps the two in step. Here so that this is right on its own terms
+        // rather than by appeal to that.
+        census.shift(counted_at, level, tasks);
+        census.join(level);
+        state.level = level;
+        state.tasks += 1;
+    }
+
+    /// Counts one fewer, at wherever this handle currently has them.
+    pub(crate) fn census_leave(&self) {
+        let mut state = self.0.census.lock().unwrap();
+        if let Some(census) = &state.census {
+            census.leave(state.level);
+        }
+        state.tasks -= 1;
+    }
+
     /// The level right now, accounting for boosts. One relaxed load.
+    #[inline]
     pub fn effective(&self) -> Priority {
         Priority::from_level(self.level())
     }
 
     /// The share accounting shared by every task holding this handle.
+    #[inline(always)]
     pub(crate) fn accounting(&self) -> &Accounting {
         &self.0.accounting
     }
 
     /// The level right now, as the executor's dense index.
     ///
-    /// Crate-internal; callers want [`Self::effective`].
+    /// Crate-internal; callers want [`Self::effective`]. One load, read for
+    /// every enqueue and every dispatch.
+    #[inline(always)]
     pub(crate) fn level(&self) -> u8 {
         self.0.effective.load(Ordering::Relaxed)
     }
@@ -232,8 +296,14 @@ impl SharedPriority {
     /// Takes effect at the task's next enqueue; a task already queued keeps the
     /// level it was queued at for one dispatch.
     pub fn set_base(&self, base: Priority) {
-        self.0.base.store(base.level(), Ordering::Relaxed);
-        self.recompute();
+        let changed = {
+            let boosts = self.0.boosts.lock().unwrap();
+            // Stored under the boosts lock, which is what makes this and the
+            // reconcile that reads it one step. Written nowhere else.
+            self.0.base.store(base.level(), Ordering::Relaxed);
+            self.reconcile(&boosts)
+        };
+        self.propagate_if_changed(changed);
     }
 
     /// Holds this task at at least `level` until the returned guard is dropped.
@@ -275,18 +345,19 @@ impl SharedPriority {
     }
 
     fn add_boost(&self, level: u8) {
-        {
+        let changed = {
             let mut boosts = self.0.boosts.lock().unwrap();
             match boosts.iter_mut().find(|(l, _)| *l == level) {
                 Some((_, count)) => *count += 1,
                 None => boosts.push((level, 1)),
             }
-        }
-        self.recompute();
+            self.reconcile(&boosts)
+        };
+        self.propagate_if_changed(changed);
     }
 
     fn remove_boost(&self, level: u8) {
-        {
+        let changed = {
             let mut boosts = self.0.boosts.lock().unwrap();
             if let Some(index) = boosts.iter().position(|(l, _)| *l == level) {
                 boosts[index].1 -= 1;
@@ -296,24 +367,49 @@ impl SharedPriority {
             } else {
                 debug_assert!(false, "removed a boost that was never added");
             }
-        }
-        self.recompute();
+            self.reconcile(&boosts)
+        };
+        self.propagate_if_changed(changed);
     }
 
-    /// Reconcile `effective` with `base` and the boosts, then push the result
-    /// to anything depending on this.
-    fn recompute(&self) {
-        let level = {
-            let boosts = self.0.boosts.lock().unwrap();
-            boosts
-                .iter()
-                .map(|(l, _)| *l)
-                .min()
-                .unwrap_or(u8::MAX)
-                .min(self.0.base.load(Ordering::Relaxed))
-        };
+    /// Reconciles `effective` with `base` and `boosts`, returning the new level
+    /// if it moved.
+    ///
+    /// Takes the boosts as proof they are held: what this reads and what it
+    /// writes have to be one step. Computing the level from a released snapshot
+    /// lets a second writer land between the two, and whichever wrote last
+    /// leaves `effective` describing neither — a connection stuck at its base
+    /// with a live [`Boost`], or holding one it has given back, until something
+    /// else happens to re-level it.
+    ///
+    /// Lock order is boosts, then census, and nothing takes them the other way
+    /// round: [`Self::census_join`] and [`Self::census_leave`] take only the
+    /// census, and [`Self::propagate`], which reaches other handles' locks, runs
+    /// with both released.
+    fn reconcile(&self, boosts: &[(u8, u32)]) -> Option<u8> {
+        let level = boosts
+            .iter()
+            .map(|(l, _)| *l)
+            .min()
+            .unwrap_or(u8::MAX)
+            .min(self.0.base.load(Ordering::Relaxed));
+        // Under the census lock as well, so the level and the count of tasks at
+        // it move together.
+        let mut state = self.0.census.lock().unwrap();
         let previous = self.0.effective.swap(level, Ordering::Relaxed);
-        if previous != level {
+        if let Some(census) = &state.census {
+            census.shift(state.level, level, state.tasks);
+        }
+        state.level = level;
+        (previous != level).then_some(level)
+    }
+
+    /// Pushes the result of a [`Self::reconcile`] to anything depending on this.
+    ///
+    /// Separate so it is plain that every caller does this with the locks
+    /// released: it reaches other handles.
+    fn propagate_if_changed(&self, changed: Option<u8>) {
+        if let Some(level) = changed {
             self.propagate(level);
         }
     }
@@ -486,5 +582,80 @@ mod tests {
         let b = a.clone();
         a.set_base(Priority::User(L1));
         assert_eq!(b.effective(), Priority::User(L1));
+    }
+
+    /// A held boost is honoured however hard the base is moved underneath it.
+    ///
+    /// [`Priority::Main`] is the best level there is, so while a boost to it is
+    /// outstanding no reconcile can conclude anything else: whatever the base
+    /// says, the minimum is `Main`. That makes it an invariant a second thread
+    /// can check continuously, which is what this needs, because the failure it
+    /// is for does not survive to the end of a run.
+    ///
+    /// That failure: a writer reads the boosts, is overtaken by the boost being
+    /// taken, and then stores a level computed from before it existed. The
+    /// handle is left below its own boost, and stays there until something else
+    /// happens to re-level it. Under churn the next write repairs it in
+    /// microseconds, so a test that only inspects the settled level sees
+    /// nothing wrong; the breach has to be caught while it is open.
+    ///
+    /// Single-threaded callers cannot reach any of this, which is why this test
+    /// insists on threads.
+    #[test]
+    fn a_held_boost_is_never_undercut_by_a_concurrent_writer() {
+        const MOVERS: usize = 3;
+        const ROUNDS: usize = 20_000;
+
+        let shared = SharedPriority::new(Priority::New);
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let breach = Mutex::new(None);
+
+        std::thread::scope(|scope| {
+            for thread in 0..MOVERS {
+                let shared = shared.clone();
+                let stop = &stop;
+                scope.spawn(move || {
+                    let mut round = 0usize;
+                    while !stop.load(Ordering::Relaxed) {
+                        // Two levels, both worse than `Main`, so neither can
+                        // ever be the right answer while the boost below is
+                        // held.
+                        shared.set_base(if (thread + round).is_multiple_of(2) {
+                            Priority::User(L1)
+                        } else {
+                            Priority::New
+                        });
+                        round += 1;
+                    }
+                });
+            }
+
+            for _ in 0..ROUNDS {
+                let boost = shared.boost(Priority::Main);
+                // Re-read rather than checked once: a writer that overtook the
+                // boost lands its stale store at some point during the hold,
+                // not necessarily before this line is first reached.
+                let seen = (0..8)
+                    .map(|_| shared.effective())
+                    .find(|seen| *seen != Priority::Main);
+                drop(boost);
+                if let Some(seen) = seen {
+                    *breach.lock().unwrap() = Some(seen);
+                    break;
+                }
+            }
+            // Recorded rather than asserted, and stopped on every path: an
+            // assertion here would unwind past this store and leave the movers
+            // spinning, which `scope` would then wait on forever.
+            stop.store(true, Ordering::Relaxed);
+        });
+
+        let breach = breach.lock().unwrap();
+        assert!(
+            breach.is_none(),
+            "a boost to {:?} was outstanding and the handle sat at {:?}",
+            Priority::Main,
+            breach.unwrap()
+        );
     }
 }

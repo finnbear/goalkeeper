@@ -461,7 +461,11 @@ async fn run(
 
     let churn = tokio::spawn(churn(gk.clone(), Arc::clone(&registry), Arc::clone(&stop)));
 
-    tokio::time::sleep(RUN).await;
+    // Sampled mid-run rather than at either end, so the drain below is measured
+    // against a census that was populated rather than one that never filled.
+    tokio::time::sleep(RUN / 2).await;
+    let busy = gk.tasks();
+    tokio::time::sleep(RUN / 2).await;
 
     // Nothing should be refused while the drain is being watched, and a binding
     // memory limit would refuse the reservations whose release is the point.
@@ -509,7 +513,8 @@ async fn run(
     let memory = gk.memory_usage().held_total();
     let tx = gk.bandwidth_usage().moved_total(Direction::Tx);
     let rx = gk.bandwidth_usage().moved_total(Direction::Rx);
-    let alive = gk.tasks().alive();
+    let drained = gk.tasks();
+    let alive = drained.alive();
     let mut charged: Vec<(std::net::IpAddr, u32, u32)> = Vec::new();
     gk.address_stats(|ip, stats| {
         if stats.connections != 0 || stats.active_sessions != 0 {
@@ -537,6 +542,32 @@ async fn run(
         "a window's worth of received bytes never rolled away"
     );
     assert_eq!(alive, 0, "tasks outlived the servers that spawned them");
+
+    // The census is maintained rather than derived, so it can be wrong in a way
+    // the total cannot: a task that dies at a level it was moved to, after
+    // being counted at the one it started at, leaves a level negative and
+    // another positive while the two still sum to zero. Checked level by level
+    // for that reason.
+    let stranded: Vec<_> = drained
+        .alive_by_priority()
+        .filter(|&(_, count)| count != 0)
+        .collect();
+    assert!(
+        stranded.is_empty(),
+        "the task census did not balance level by level: {stranded:?}"
+    );
+
+    // Proves the balance above is a drain and not an empty census all along.
+    // The churn re-levels every connection many times over the run, so these
+    // counts have moved between levels repeatedly by now.
+    assert!(
+        busy.alive() > 0,
+        "no task was ever counted, so nothing was drained from the census"
+    );
+    assert!(
+        busy.alive_at(Priority::Accept) > 0,
+        "the accept loops were not counted, so the census misses whole levels"
+    );
 
     // Everything that reached the pool left it. The residue is what is still in
     // flight, and a handshake in flight holds a slot and a task.

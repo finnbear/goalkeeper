@@ -11,6 +11,9 @@
 //! that `/proc` calls 25% busy.
 
 pub mod bandwidth;
+/// Only TLS and QUIC have crypto to ration, so without them there is no pool
+/// and nothing that could take a slot in one.
+#[cfg(feature = "tls")]
 pub mod handshake;
 pub mod ip_limiter;
 pub mod memory;
@@ -329,11 +332,16 @@ pub(crate) fn glide(gk: &Goalkeeper) {
 }
 
 /// Where the handshake pool has glided to, in `0..=1`.
+///
+/// The position is kept whatever the features, since [`glide`] is one number on
+/// the controller's tick; only the pool that reads it is behind `tls`.
+#[cfg(feature = "tls")]
 pub(crate) fn compute_glide_of(gk: &Goalkeeper) -> f32 {
     with_of(gk, |state| state.compute_glide)
 }
 
 /// The share of the gap the pool closes per tick when tightening.
+#[cfg(feature = "tls")]
 pub(crate) fn set_glide_step(gk: &Goalkeeper, step: f32) {
     with_of(gk, |state| state.glide_step = step);
 }

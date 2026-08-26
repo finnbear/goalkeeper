@@ -2,8 +2,9 @@
 //!
 //! Accept, admit, handshake, serve, ordered so the cheapest refusals happen
 //! first: the per-address limiter admits a connection before any crypto, and
-//! the handshake then takes a slot from [`crate::resource::handshake`], giving
-//! it up as soon as it resolves.
+//! under `tls` the handshake then takes a slot from `crate::resource::handshake`,
+//! giving it up as soon as it resolves. A plaintext listener has no crypto to
+//! ration and never reaches the pool.
 //!
 //! Accept loops run at [`Priority::Accept`] and connections start at
 //! [`Priority::New`]. Raise a connection with `conn.set_base(..)` as

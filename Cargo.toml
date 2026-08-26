@@ -44,7 +44,9 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 env_logger = "0.11.8"
 futures-util = "0.3.31"
 rand = "0.8.4"
-tokio = { version = "1.50", features = ["macros", "net", "rt", "sync", "time", "io-util"], default-features = false }
+# `rt-multi-thread` for `examples/ddos`, which runs the flood on a runtime of
+# its own so it is not sharing a thread with the server it is attacking.
+tokio = { version = "1.50", features = ["macros", "net", "rt", "rt-multi-thread", "sync", "time", "io-util"], default-features = false }
 
 [features]
 default = []
@@ -52,6 +54,10 @@ http = ["dep:axum", "dep:hyper", "dep:hyper-util", "dep:tower"]
 tls = ["http", "dep:rustls", "dep:tokio-rustls", "dep:arc-swap"]
 web_socket = ["http", "dep:axum-tws", "dep:futures-core", "dep:futures-sink"]
 web_transport = ["tls", "dep:wtransport"]
+
+[[example]]
+name = "ddos"
+required-features = ["web_socket"]
 
 [[bench]]
 name = "bandwidth"

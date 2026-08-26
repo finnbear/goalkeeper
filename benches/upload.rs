@@ -137,8 +137,8 @@ fn runtime() -> tokio::runtime::Runtime {
 /// from one loopback address is stood down, and the ration is the one thing
 /// goalkeeper is meant to act on.
 fn configure() {
-    SystemGoalkeeper.set_handshake_capacity(4096, 4096);
-    SystemGoalkeeper.set_handshake_slow_per_ip(4096, 4096);
+    // No handshake pool to stand down: this serves plaintext, and the pool is
+    // behind `tls` because crypto is the only thing it rations.
     // Large rather than `u32::MAX`: a per-second rate is turned into a period
     // by dividing a second by it, and a rate above a billion rounds that period
     // to zero.

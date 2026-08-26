@@ -26,7 +26,7 @@ use crate::executor::priority::{Priority, SharedPriority};
 use async_task::{Runnable, Task};
 use std::collections::VecDeque;
 use std::future::{Future, poll_fn};
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Poll, Waker};
 use std::time::{Duration, Instant};
@@ -110,15 +110,39 @@ impl Default for Config {
 /// schedule numbers its levels.
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
 pub struct Tasks {
-    alive: usize,
+    alive: [usize; Priority::LEVELS],
     queued: [usize; Priority::LEVELS],
     parked: usize,
 }
 
 impl Tasks {
-    /// Spawned and not yet finished or cancelled.
+    /// Spawned and not yet finished or cancelled, at every level together.
     pub fn alive(&self) -> usize {
+        self.alive.iter().sum()
+    }
+
+    /// Spawned and not yet finished or cancelled, at `priority`.
+    ///
+    /// A task counts at the level it is at now, not the one it started at: a
+    /// connection admitted at [`Priority::New`] and raised once it proves
+    /// itself moves this count with it, and so do the other tasks sharing its
+    /// [`SharedPriority`].
+    pub fn alive_at(&self, priority: Priority) -> usize {
+        self.alive[priority.level() as usize]
+    }
+
+    /// Spawned and not yet finished or cancelled, level by level, most urgent
+    /// first.
+    ///
+    /// Every level is yielded, including empty ones. This is the breakdown that
+    /// separates what a stranger created from what the application has vouched
+    /// for: everything from [`Priority::New`] down is a peer nothing is yet
+    /// known about.
+    pub fn alive_by_priority(&self) -> impl Iterator<Item = (Priority, usize)> + '_ {
         self.alive
+            .iter()
+            .enumerate()
+            .map(|(level, &count)| (Priority::from_level(level as u8), count))
     }
 
     /// Enqueued and waiting to run, at every level together.
@@ -144,6 +168,58 @@ impl Tasks {
     /// Set aside for spending their share, awaiting the next refill.
     pub fn parked(&self) -> usize {
         self.parked
+    }
+}
+
+/// Live tasks at each level.
+///
+/// Kept up to date as tasks are spawned, finish and change level, so reading it
+/// is a snapshot rather than a walk. The maintenance is the price: a handle
+/// changing level moves every task sharing it, which is why the count lives
+/// beside the level rather than on each task.
+///
+/// One lock over the whole array rather than a counter per level, so a reader
+/// sees a whole picture. Moving a handle is a subtraction and an addition, and
+/// with a counter each there is a moment between them when the array describes
+/// a process short of however many tasks that handle has — an undercount a
+/// caller has no way to recognise. Affordable because nothing on the polling
+/// path comes here: only spawning, finishing and re-levelling do, and a level
+/// that changed as often as a task is polled would be a different problem.
+#[derive(Debug, Default)]
+pub(crate) struct Census(Mutex<[usize; Priority::LEVELS]>);
+
+impl Census {
+    /// Moves `count` tasks from `from` to `to`.
+    #[inline]
+    pub(crate) fn shift(&self, from: u8, to: u8, count: usize) {
+        if from == to || count == 0 {
+            return;
+        }
+        let mut levels = self.0.lock().unwrap();
+        debug_assert!(levels[from as usize] >= count, "moved tasks nobody counted");
+        levels[from as usize] = levels[from as usize].saturating_sub(count);
+        levels[to as usize] += count;
+    }
+
+    /// Records one more task at `level`.
+    #[inline]
+    pub(crate) fn join(&self, level: u8) {
+        self.0.lock().unwrap()[level as usize] += 1;
+    }
+
+    /// Records one fewer.
+    #[inline]
+    pub(crate) fn leave(&self, level: u8) {
+        let mut levels = self.0.lock().unwrap();
+        debug_assert!(
+            levels[level as usize] > 0,
+            "a task left a level it never joined"
+        );
+        levels[level as usize] = levels[level as usize].saturating_sub(1);
+    }
+
+    fn snapshot(&self) -> [usize; Priority::LEVELS] {
+        *self.0.lock().unwrap()
     }
 }
 
@@ -177,7 +253,9 @@ struct Shared {
     /// Which levels have something queued. Read without the lock, written only
     /// under it, so it never disagrees with the queues.
     ready: AtomicU32,
-    alive: AtomicUsize,
+    /// Shared with every [`SharedPriority`] a task was spawned against, since
+    /// that is what moves tasks between levels.
+    census: Arc<Census>,
     inner: Mutex<Inner>,
     /// When this executor started, so instants can be stored as `u64` offsets.
     epoch_instant: Instant,
@@ -195,7 +273,7 @@ impl Executor {
     pub fn new(config: Config) -> Self {
         Self(Arc::new(Shared {
             ready: AtomicU32::new(0),
-            alive: AtomicUsize::new(0),
+            census: Arc::new(Census::default()),
             inner: Mutex::new(Inner::new(config)),
             epoch_instant: Instant::now(),
         }))
@@ -225,13 +303,16 @@ impl Executor {
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
+        // Counted against the handle rather than the task, so that when the
+        // handle moves it takes every task sharing it along. Joined before the
+        // future exists, so a task is never live and uncounted.
+        priority.census_join(&self.0.census);
         let state = Arc::new(TaskState::new(priority));
         let shared = Arc::clone(&self.0);
         let scheduled = Arc::clone(&state);
-        // Decremented however the future ends, which `Runnable::run`'s return
-        // value cannot distinguish.
-        let alive = Alive(Arc::clone(&self.0));
-        shared.alive.fetch_add(1, Ordering::Relaxed);
+        // Left however the future ends, which `Runnable::run`'s return value
+        // cannot distinguish.
+        let alive = Alive(state.priority.clone());
         let (runnable, task) = async_task::spawn(
             async move {
                 let _alive = alive;
@@ -373,7 +454,7 @@ impl Executor {
             queued[level] = queue.len();
         }
         Tasks {
-            alive: self.0.alive.load(Ordering::Relaxed),
+            alive: self.0.census.snapshot(),
             queued,
             parked: inner.parked.len(),
         }
@@ -390,11 +471,11 @@ impl Executor {
 }
 
 /// Decrements the live count however its future ends.
-struct Alive(Arc<Shared>);
+struct Alive(SharedPriority);
 
 impl Drop for Alive {
     fn drop(&mut self) {
-        self.0.alive.fetch_sub(1, Ordering::Relaxed);
+        self.0.census_leave();
     }
 }
 
@@ -476,6 +557,7 @@ impl Inner {
 }
 
 impl Shared {
+    #[inline(always)]
     fn now_nanos(&self, now: Instant) -> u64 {
         now.saturating_duration_since(self.epoch_instant).as_nanos() as u64
     }
@@ -489,6 +571,7 @@ impl Shared {
     }
 
     /// Enqueues a woken task at whatever level it is at *now*.
+    #[inline]
     fn push(shared: &Arc<Shared>, job: Job) {
         let level = job.state.priority.level() as usize;
         debug_assert!(level < Priority::LEVELS, "level {level} is off the ladder");
@@ -549,6 +632,7 @@ impl Shared {
     }
 
     /// Puts one job back on its queue and marks its level occupied.
+    #[inline(always)]
     fn requeue(ready: &AtomicU32, inner: &mut Inner, job: Job) {
         let level = job.state.priority.level() as usize;
         inner.queues[level].push_front(job);
@@ -589,6 +673,7 @@ impl Shared {
     }
 
     /// Charges a poll to the task that took it.
+    #[inline(always)]
     fn charge(&self, state: &Arc<TaskState>, spent: Duration, aged: bool) {
         state
             .priority
@@ -629,6 +714,7 @@ impl Shared {
 
     /// Whether `job` may run, counting it as a participant the first time it is
     /// considered in a window.
+    #[inline]
     fn admit(&self, inner: &mut Inner, job: &Job, level: usize, config: &Config) -> bool {
         // Per connection, not per task: several tasks may share this and count
         // and spend as one. See `priority::Accounting`.
@@ -715,6 +801,7 @@ impl Shared {
 mod tests {
     use super::*;
     use crate::executor::priority::UserPriority::*;
+    use std::sync::atomic::AtomicUsize;
 
     /// Runs `body` on a fresh runtime and a fresh scheduler, so tests cannot
     /// see each other's queues.
@@ -920,12 +1007,120 @@ mod tests {
             let cancelled = ex.spawn(Priority::New, async {
                 tokio::time::sleep(Duration::from_secs(60)).await;
             });
-            assert_eq!(ex.tasks().alive, 2);
+            let tasks = ex.tasks();
+            assert_eq!(tasks.alive(), 2);
+            // Counted where they are, not merely counted.
+            assert_eq!(tasks.alive_at(Priority::User(L0)), 1);
+            assert_eq!(tasks.alive_at(Priority::New), 1);
             let _ = finished.await;
             drop(cancelled);
             tokio::time::sleep(Duration::from_millis(10)).await;
         }));
-        assert_eq!(executor.tasks().alive, 0);
+        assert_eq!(executor.tasks().alive(), 0);
+        assert!(executor.tasks().alive_by_priority().all(|(_, n)| n == 0));
+    }
+
+    /// A task counts at the level its handle is at now, and moves with it.
+    #[test]
+    fn re_levelling_a_handle_moves_every_task_sharing_it() {
+        let executor = Executor::new(brisk());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let driven = executor.clone();
+        let ex = executor.clone();
+        runtime.block_on(driven.run_until(crate::system(), async move {
+            // Two tasks on one handle, as a connection and its streams are.
+            let shared = SharedPriority::new(Priority::New);
+            let tasks: Vec<_> = (0..2)
+                .map(|_| {
+                    ex.spawn_with(shared.clone(), async {
+                        tokio::time::sleep(Duration::from_secs(60)).await;
+                    })
+                })
+                .collect();
+            assert_eq!(ex.tasks().alive_at(Priority::New), 2);
+
+            shared.set_base(Priority::User(L0));
+            let moved = ex.tasks();
+            assert_eq!(moved.alive_at(Priority::New), 0, "left behind");
+            assert_eq!(moved.alive_at(Priority::User(L0)), 2, "both moved");
+
+            // A boost composes over the base and takes them along too.
+            let boost = shared.boost(Priority::Main);
+            assert_eq!(ex.tasks().alive_at(Priority::Main), 2);
+            drop(boost);
+            assert_eq!(ex.tasks().alive_at(Priority::User(L0)), 2, "given back");
+
+            // Dying at the level they were moved to, not the one they started
+            // at, which is what would leave a count stranded.
+            drop(tasks);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            assert_eq!(ex.tasks().alive(), 0);
+            assert!(ex.tasks().alive_by_priority().all(|(_, n)| n == 0));
+        }));
+    }
+
+    /// A reader never catches the census mid-move.
+    ///
+    /// Re-levelling is a subtraction and an addition. With a counter per level
+    /// there is a moment between them where the tasks being moved are at no
+    /// level at all, and a reader landing there is told the process has fewer
+    /// tasks than it does — silently, since nothing about the answer says it was
+    /// taken mid-flight. The total is fixed and known here, so any reading other
+    /// than that total is that gap.
+    #[test]
+    fn a_reader_never_sees_a_partly_moved_census() {
+        const TASKS: usize = 16;
+
+        let executor = Executor::new(brisk());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let driven = executor.clone();
+        let ex = executor.clone();
+        runtime.block_on(driven.run_until(crate::system(), async move {
+            // One handle, so every move is all of them at once and the window
+            // is as wide as this can make it.
+            let shared = SharedPriority::new(Priority::New);
+            let _tasks: Vec<_> = (0..TASKS)
+                .map(|_| {
+                    ex.spawn_with(shared.clone(), async {
+                        tokio::time::sleep(Duration::from_secs(60)).await;
+                    })
+                })
+                .collect();
+
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let mover = {
+                let shared = shared.clone();
+                let stop = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        shared.set_base(Priority::User(L0));
+                        shared.set_base(Priority::Accept);
+                    }
+                })
+            };
+
+            let mut seen = Vec::new();
+            for _ in 0..200_000 {
+                let alive = ex.tasks().alive();
+                if alive != TASKS {
+                    seen.push(alive);
+                    break;
+                }
+            }
+            stop.store(true, Ordering::Relaxed);
+            let _ = mover.join();
+
+            assert!(
+                seen.is_empty(),
+                "a snapshot read {seen:?} while {TASKS} tasks were alive"
+            );
+        }));
     }
 
     #[test]
@@ -1026,7 +1221,7 @@ mod tests {
             snapshot.queued.iter().all(|n| *n == 0) && snapshot.parked == 0,
             "left behind: {snapshot:?}"
         );
-        assert_eq!(snapshot.alive, 0);
+        assert_eq!(snapshot.alive(), 0);
     }
 
     #[test]

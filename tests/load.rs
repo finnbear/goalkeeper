@@ -296,6 +296,7 @@ fn a_connection_flood_from_one_address_is_refused_while_others_get_through() {
 /// which costs an attacker almost nothing and would otherwise hold the pool
 /// open indefinitely.
 #[test]
+#[cfg(feature = "tls")]
 fn a_slow_handshake_flood_cannot_hold_the_pool() {
     let _serial = serial();
     let start = Instant::now();

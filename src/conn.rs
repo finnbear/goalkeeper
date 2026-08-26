@@ -141,17 +141,20 @@ impl<P: ProvideGoalkeeper> Conn<P> {
 
     /// Returns where the connection came from, with any IPv4-in-IPv6 mapping
     /// undone.
+    #[inline(always)]
     pub fn peer(&self) -> SocketAddr {
         self.0.peer
     }
 
     /// Returns the peer's address, which everything per-address is keyed on.
+    #[inline(always)]
     pub fn ip(&self) -> IpAddr {
         self.0.ip
     }
 
     /// Returns this connection's priority, shared with every task serving it,
     /// so re-levelling here re-levels all of them.
+    #[inline(always)]
     pub fn priority(&self) -> &SharedPriority {
         &self.0.priority
     }
@@ -295,6 +298,10 @@ impl<P: ProvideGoalkeeper> Conn<P> {
 
     /// Records `bytes` moved in `dir` against this connection, and, once a few
     /// kilobytes have gathered, against whatever ration applies to it.
+    ///
+    /// Every socket operation reaches this, and all but one in
+    /// `FLUSH_BYTES / read size` of them do nothing but the counters here.
+    #[inline]
     pub fn record(&self, dir: Direction, bytes: u64) {
         match dir {
             Direction::Tx => self.0.tx.fetch_add(bytes, Ordering::Relaxed),

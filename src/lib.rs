@@ -20,9 +20,9 @@
 //!   sorts by.
 //! - [`resource`] rations everything a peer can consume: bytes
 //!   ([`resource::bandwidth`]), memory ([`resource::memory`]), connections per
-//!   address ([`resource::ip_limiter`]) and concurrent crypto
-//!   ([`resource::handshake`]). The module itself is how close the process is
-//!   to each of its limits.
+//!   address ([`resource::ip_limiter`]) and, under `tls`, concurrent crypto
+//!   (`resource::handshake`). The module itself is how close the process is to
+//!   each of its limits.
 //! - [`conn`] is the per-connection state the rest of it hangs off: the kill
 //!   switch, the byte metering, the priority.
 //!
@@ -63,6 +63,7 @@ pub mod executor;
 pub mod http;
 pub mod rate_limiter;
 pub mod resource;
+pub mod tcp;
 pub(crate) mod tokio_net;
 #[cfg(feature = "web_transport")]
 pub mod web_transport;
@@ -98,6 +99,7 @@ pub struct Goalkeeper {
     /// between priorities.
     pub(crate) limiter: crate::resource::ip_limiter::IpLimiter,
     /// Handshake slots, which ration concurrent crypto.
+    #[cfg(feature = "tls")]
     pub(crate) handshakes: crate::resource::handshake::HandshakeSemaphore,
     /// One beat per memory-controller tick.
     ///
@@ -164,6 +166,7 @@ pub trait ProvideGoalkeeper:
     /// `accepted` is when the connection arrived rather than when the task
     /// carrying it was scheduled, so time spent waiting its turn counts against
     /// it.
+    #[cfg(feature = "tls")]
     fn handshake_slot(
         &self,
         ip: IpAddr,
@@ -505,6 +508,10 @@ impl Goalkeeper {
     }
 
     // ----------------------------------------------------------- handshakes
+    //
+    // Behind `tls`, since the pool rations crypto and a plaintext listener has
+    // none: without it these would report zero forever and configure something
+    // nothing consults.
 
     /// What has happened to handshakes since this was last asked, and the start
     /// of a fresh window.
@@ -512,6 +519,7 @@ impl Goalkeeper {
     /// Reading resets, so consecutive readings partition the time between them.
     /// Nothing depends on it being called, but there should be one caller: a
     /// second would silently take part of the first's window.
+    #[cfg(feature = "tls")]
     pub fn handshake_counts(&self) -> crate::resource::handshake::Counts {
         crate::resource::handshake::counts(self)
     }
@@ -524,6 +532,7 @@ impl Goalkeeper {
     /// unchanged patience sheds more legitimate traffic, not less.
     ///
     /// Default: `32`, `16`
+    #[cfg(feature = "tls")]
     pub fn set_handshake_capacity(&self, normal: usize, pressured: usize) {
         crate::resource::handshake::set_policy(self, |p, pressed| {
             p.capacity = if pressed { pressured } else { normal }
@@ -537,6 +546,7 @@ impl Goalkeeper {
     /// two.
     ///
     /// Default: `15s`, `3s`
+    #[cfg(feature = "tls")]
     pub fn set_handshake_deadline(&self, normal: Duration, pressured: Duration) {
         crate::resource::handshake::set_policy(self, |p, pressed| {
             p.deadline = if pressed { pressured } else { normal }
@@ -548,6 +558,7 @@ impl Goalkeeper {
     /// Comfortably longer than the round trip or two a real one costs.
     ///
     /// Default: `1s`, `500ms`
+    #[cfg(feature = "tls")]
     pub fn set_handshake_slow(&self, normal: Duration, pressured: Duration) {
         crate::resource::handshake::set_policy(self, |p, pressed| {
             p.slow = if pressed { pressured } else { normal }
@@ -561,6 +572,7 @@ impl Goalkeeper {
     /// clients as one address.
     ///
     /// Default: `2`, `2`
+    #[cfg(feature = "tls")]
     pub fn set_handshake_slow_per_ip(&self, normal: usize, pressured: usize) {
         crate::resource::handshake::set_policy(self, |p, pressed| {
             p.slow_per_ip = if pressed { pressured } else { normal }
@@ -713,6 +725,7 @@ impl Goalkeeper {
     /// finish. It relaxes at a quarter of this.
     ///
     /// Default: `0.25`
+    #[cfg(feature = "tls")]
     pub fn set_handshake_glide_step(&self, step: f32) {
         crate::resource::set_glide_step(self, step);
     }
