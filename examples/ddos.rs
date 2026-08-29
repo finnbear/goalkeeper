@@ -52,6 +52,13 @@ const RUN: Duration = Duration::from_secs(20);
 /// How often the running report is printed.
 const REPORT: Duration = Duration::from_secs(2);
 
+/// How often goalkeeper's own view of the process is printed.
+///
+/// Its own cadence rather than a column on [`REPORT`], since it answers a
+/// different question: that report says what the limiter did, this says what it
+/// currently believes about the host.
+const PRESSURE: Duration = Duration::from_secs(3);
+
 /// Addresses each behaviour attacks from, so a per-address limit is not the
 /// only thing being measured.
 const ADDRESSES_EACH: u16 = 12;
@@ -228,10 +235,19 @@ async fn flood(server: SocketAddr, stop: Arc<AtomicBool>) -> (Vec<Behaviour>, Ve
         }
     }
 
+    // Two cadences against one deadline. `interval_at` rather than `interval`
+    // because the latter fires immediately, which would print both lines before
+    // a single client had connected.
     let started = tokio::time::Instant::now();
-    while started.elapsed() < RUN {
-        tokio::time::sleep(REPORT).await;
-        report();
+    let mut reports = tokio::time::interval_at(started + REPORT, REPORT);
+    let mut pressures = tokio::time::interval_at(started + PRESSURE, PRESSURE);
+    let mut deadline = std::pin::pin!(tokio::time::sleep_until(started + RUN));
+    loop {
+        tokio::select! {
+            _ = &mut deadline => break,
+            _ = reports.tick() => report(),
+            _ = pressures.tick() => pressure(),
+        }
     }
     (cohorts, tallies)
 }
@@ -391,6 +407,33 @@ fn text_frame(payload: &[u8]) -> Vec<u8> {
             .map(|(index, byte)| byte ^ MASK[index % 4]),
     );
     frame
+}
+
+/// What goalkeeper measures about the host for itself.
+///
+/// Internal rather than combined, so this is goalkeeper's own reading and not
+/// anything an application has reported: scheduling lateness for `cpu`, the
+/// share of the bandwidth budget the ledger saw for `network`. `ram` is never
+/// measured internally, since the meaningful ceiling is a deployment's
+/// business, so it reads zero here.
+///
+/// Worth watching under load because these drive
+/// [`strained`][goalkeeper::ProvideGoalkeeper::strained], which the per-address
+/// limiter consults before admitting anything: a reading that climbs on its own
+/// tightens admission with nothing actually wrong.
+fn pressure() {
+    let pressure = SystemGoalkeeper.internal_pressure();
+    println!(
+        "pressure   cpu {:>6.3}  network {:>6.3}  ram {:>6.3}{}",
+        pressure.cpu,
+        pressure.network,
+        pressure.ram,
+        if SystemGoalkeeper.strained() {
+            "  (strained)"
+        } else {
+            ""
+        },
+    );
 }
 
 /// What goalkeeper is holding and what it has turned away.

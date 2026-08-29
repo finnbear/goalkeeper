@@ -480,7 +480,16 @@ impl Addresses {
         if entry.stats.connections >= limit {
             entry.stats.last_limit = Some(now);
             self.permits_withheld = self.permits_withheld.saturating_add(1);
-            self.warn(ip, label, "too many connections", now);
+            self.warn(
+                ip,
+                label,
+                if strict {
+                    "too many connections (strict)"
+                } else {
+                    "too many connections"
+                },
+                now,
+            );
             None
         } else {
             entry.stats.connections += 1;
@@ -492,6 +501,12 @@ impl Addresses {
     /// Says something about a limited address, at most once a second across the
     /// whole process. Under a distributed flood, logging each refusal would be
     /// the louder denial of service.
+    ///
+    /// `why` is a literal rather than something formatted, since it is built on
+    /// every refusal and used on almost none of them. A caller wanting to say
+    /// which of several regimes refused an address picks between literals; one
+    /// wanting to interpolate a number would be doing that work per refused
+    /// connection, which is exactly the traffic this is rate limited against.
     fn warn(&mut self, ip: IpAddr, label: &'static str, why: &'static str, now: Instant) {
         if self
             .warning_limiter

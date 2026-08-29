@@ -472,31 +472,9 @@ pub(crate) fn throttled<P: ProvideGoalkeeper>(
 #[cfg(feature = "web_transport")]
 pub(crate) fn record_socket_total(dir: Direction, total: u64) {
     let now = Instant::now();
-    crate::system().limiter.with_process(|_, inner, _| {
-        let config = inner.config;
-        inner.roll(now, &config);
-        let attributed = match dir {
-            Direction::Tx => {
-                inner.socket_tx = total;
-                inner.attributed_tx
-            }
-            Direction::Rx => {
-                inner.socket_rx = total;
-                inner.attributed_rx
-            }
-        };
-        // Clamped, since the two are sampled a moment apart and the
-        // connections' total can briefly run ahead of the socket's.
-        let unattributed = total.saturating_sub(attributed);
-        // Charged at `New`, which is what unattributed traffic is. Attribution
-        // is per connection rather than per address, so it can never be
-        // laundered into a better level.
-        let level = Priority::New.level() as usize;
-        match dir {
-            Direction::Tx => inner.tx[level] = unattributed,
-            Direction::Rx => inner.rx[level] = unattributed,
-        }
-    });
+    crate::system()
+        .limiter
+        .with_process(|_, inner, _| inner.record_socket_total(dir, total, now));
 }
 
 /// What the ledger has seen this window, for whoever reports on the process.
@@ -577,8 +555,15 @@ pub(crate) struct Ledger {
     epoch: u64,
     tx: [u64; Priority::LEVELS],
     rx: [u64; Priority::LEVELS],
+    /// The socket meter's last reading, which counts for the socket's life
+    /// rather than for a window. Deliberately not cleared by [`Self::roll`]:
+    /// it is the baseline the next sample's delta is taken against.
     socket_tx: u64,
     socket_rx: u64,
+    /// Bytes seen at the shared socket this window, accumulated from those
+    /// deltas. This is the per-window figure `attributed_*` is comparable to.
+    wire_tx: u64,
+    wire_rx: u64,
     attributed_tx: u64,
     attributed_rx: u64,
     /// Woken when the ration refills. Bounded by the number of connections
@@ -596,6 +581,8 @@ impl Default for Ledger {
             rx: [0; Priority::LEVELS],
             socket_tx: 0,
             socket_rx: 0,
+            wire_tx: 0,
+            wire_rx: 0,
             attributed_tx: 0,
             attributed_rx: 0,
             wakers: Vec::new(),
@@ -608,6 +595,51 @@ impl Ledger {
         match dir {
             Direction::Tx => self.attributed_tx = self.attributed_tx.saturating_add(bytes),
             Direction::Rx => self.attributed_rx = self.attributed_rx.saturating_add(bytes),
+        }
+    }
+
+    /// See [`record_socket_total`], whose body this is. Split out so a test can
+    /// drive it with a clock of its own: the free function reaches for the
+    /// process-wide ledger and the wall clock, and the property worth asserting
+    /// is about what happens *across* a window boundary.
+    #[cfg_attr(not(feature = "web_transport"), allow(dead_code))]
+    fn record_socket_total(&mut self, dir: Direction, total: u64, now: Instant) {
+        let config = self.config;
+        self.roll(now, &config);
+        // `total` counts the socket's whole life, while everything else here is
+        // one window, so what this window carried is the growth since the last
+        // sample. Comparing the lifetime figure against a per-window one
+        // instead leaves a remainder that only ever grows, which reads as a
+        // link permanently many times over its budget.
+        //
+        // Sampling runs at the window's own cadence, so a delta is about one
+        // window's traffic and is credited to whichever window observes it.
+        // That is a phase lag of at most one window, not an error in how much:
+        // the bytes are counted once, against a budget of the same length.
+        let (wire, attributed) = match dir {
+            Direction::Tx => {
+                let since = total.saturating_sub(self.socket_tx);
+                self.socket_tx = total;
+                self.wire_tx = self.wire_tx.saturating_add(since);
+                (self.wire_tx, self.attributed_tx)
+            }
+            Direction::Rx => {
+                let since = total.saturating_sub(self.socket_rx);
+                self.socket_rx = total;
+                self.wire_rx = self.wire_rx.saturating_add(since);
+                (self.wire_rx, self.attributed_rx)
+            }
+        };
+        // Clamped, since the two are sampled a moment apart and the
+        // connections' total can briefly run ahead of the socket's.
+        let unattributed = wire.saturating_sub(attributed);
+        // Charged at `New`, which is what unattributed traffic is. Attribution
+        // is per connection rather than per address, so it can never be
+        // laundered into a better level.
+        let level = Priority::New.level() as usize;
+        match dir {
+            Direction::Tx => self.tx[level] = unattributed,
+            Direction::Rx => self.rx[level] = unattributed,
         }
     }
 
@@ -639,8 +671,11 @@ impl Ledger {
         self.rx = [0; Priority::LEVELS];
         self.attributed_tx = 0;
         self.attributed_rx = 0;
-        self.socket_tx = 0;
-        self.socket_rx = 0;
+        // `socket_tx`/`socket_rx` are the meter's own running totals and stay:
+        // clearing them would make the next sample's delta the socket's whole
+        // life over again, every window.
+        self.wire_tx = 0;
+        self.wire_rx = 0;
         for waker in self.wakers.drain(..) {
             waker.wake();
         }
@@ -978,18 +1013,103 @@ mod tests {
     #[test]
     fn unattributed_traffic_is_the_remainder_and_is_not_double_counted() {
         // Connections reported 700 of the 1000 the socket actually moved.
-        let mut inner = Ledger {
-            started: Some(Instant::now()),
-            attributed_tx: 700,
-            ..Default::default()
-        };
+        let mut inner = socket_ledger();
         inner.tx[Priority::User(L0).level() as usize] = 700;
-        let total = 1000u64;
-        let unattributed = total.saturating_sub(inner.attributed_tx);
-        inner.tx[Priority::New.level() as usize] = unattributed;
-        assert_eq!(unattributed, 300);
+        inner.attributed_tx = 700;
+        inner.record_socket_total(Direction::Tx, 1000, start());
+        assert_eq!(inner.tx[Priority::New.level() as usize], 300);
         let sum: u64 = inner.tx.iter().sum();
-        assert_eq!(sum, total, "the parts add up to the whole exactly once");
+        assert_eq!(sum, 1000, "the parts add up to the whole exactly once");
+    }
+
+    /// One origin for every window a case names.
+    ///
+    /// Fixed for the life of the process rather than read afresh, so
+    /// `start() + window * n` is the same instant however many times it is
+    /// written and however slowly the case runs. Taking `Instant::now()` per
+    /// call would drift by microseconds against 100ms windows — never enough to
+    /// fail, which is exactly what makes it worth removing.
+    fn start() -> Instant {
+        static ORIGIN: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
+        *ORIGIN
+    }
+
+    /// A ledger fed by the socket meter, carrying the test [`config`] since
+    /// [`Ledger::record_socket_total`] reads its own rather than taking one,
+    /// and started at [`start`] so a case can name its windows from there.
+    fn socket_ledger() -> Ledger {
+        Ledger {
+            config: config(),
+            started: Some(start()),
+            ..Default::default()
+        }
+    }
+
+    /// [`Metered`][crate::web_transport] counts with `fetch_add` and is never
+    /// reset, so the total handed to [`Ledger::record_socket_total`] is the
+    /// socket's whole life. A window's ledger holds one window's bytes, so what
+    /// is charged has to be the part that arrived since the last sample.
+    ///
+    /// The bug this guards is charging the lifetime figure to the window, which
+    /// makes the process look more strained the longer it has been up, with no
+    /// regard for the rate. It survived the case above because that one never
+    /// crossed a window boundary: within a single window the lifetime total and
+    /// the window's own bytes are the same number.
+    #[test]
+    fn only_the_bytes_since_the_last_sample_are_charged() {
+        let window = config().window;
+        let mut inner = socket_ledger();
+
+        // First window: the socket has moved 400 bytes in its life, all of them
+        // during this window.
+        inner.record_socket_total(Direction::Tx, 400, start());
+        assert_eq!(inner.tx[Priority::New.level() as usize], 400);
+
+        // Second window: another 400, for 800 over the two. The window is
+        // still owed 400 — the earlier 400 was charged to the window it
+        // happened in, and that window is over.
+        inner.record_socket_total(Direction::Tx, 800, start() + window);
+        assert_eq!(
+            inner.tx[Priority::New.level() as usize],
+            400,
+            "the window was charged the socket's lifetime total, not its own bytes"
+        );
+
+        // And a window in which the socket moved nothing owes nothing, however
+        // much it has carried before.
+        inner.record_socket_total(Direction::Tx, 800, start() + window * 2);
+        assert_eq!(
+            inner.tx[Priority::New.level() as usize],
+            0,
+            "an idle window was charged for traffic that predates it"
+        );
+    }
+
+    /// The consequence, and the reason this is worth a test of its own: the
+    /// network figure feeds [`crate::resource::strained`], which
+    /// [`crate::resource::ip_limiter`] consults before admitting a connection.
+    /// A reading that climbs on its own puts a server into strict mode with
+    /// nothing wrong with the link, and every fresh address is then held to one
+    /// connection until the strain ages out — which it cannot, because the
+    /// reading is still climbing.
+    #[test]
+    fn a_steady_link_does_not_look_more_strained_as_it_runs() {
+        let config = config();
+        // 400 bytes a window against a budget of 1_000 is two fifths of the
+        // link, and stays two fifths however long it goes on for.
+        let per_window = 400u64;
+        let mut inner = socket_ledger();
+        let mut lifetime = 0u64;
+
+        for window in 0..64u32 {
+            lifetime += per_window;
+            inner.record_socket_total(Direction::Tx, lifetime, start() + config.window * window);
+            let spent = inner.spent(&config);
+            assert!(
+                (spent - 0.4).abs() < 0.001,
+                "window {window}: a link at two fifths of its budget read as {spent} of it"
+            );
+        }
     }
 
     #[test]

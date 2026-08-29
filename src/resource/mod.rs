@@ -90,8 +90,8 @@ pub(crate) struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            enter: 0.75,
-            leave: 0.5,
+            enter: 0.925,
+            leave: 0.875,
             dwell: Duration::from_secs(1),
             // At one sample per 100ms window, roughly a one-second memory.
             smoothing: 0.25,
