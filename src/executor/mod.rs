@@ -836,9 +836,10 @@ mod tests {
             .unwrap();
         let executor = Executor::new(config);
         let driven = executor.clone();
-        // The process's goalkeeper; these exercise the schedule, not the
-        // ledgers.
-        runtime.block_on(driven.run_until(crate::system(), body(executor)))
+        // An instance of its own, for the probe to sample; these exercise the
+        // schedule, not the ledgers, and must not touch the shared one.
+        let gk = crate::ArcGoalkeeper::new();
+        runtime.block_on(driven.run_until(&gk, body(executor)))
     }
 
     /// Windows and aging short enough that a test finishes in milliseconds.
@@ -1022,7 +1023,8 @@ mod tests {
             .unwrap();
         let driven = executor.clone();
         let ex = executor.clone();
-        runtime.block_on(driven.run_until(crate::system(), async move {
+        let gk = crate::ArcGoalkeeper::new();
+        runtime.block_on(driven.run_until(&gk, async move {
             let finished = ex.spawn(Priority::User(L0), async { 1u32 });
             let cancelled = ex.spawn(Priority::New, async {
                 tokio::time::sleep(Duration::from_secs(60)).await;
@@ -1050,7 +1052,8 @@ mod tests {
             .unwrap();
         let driven = executor.clone();
         let ex = executor.clone();
-        runtime.block_on(driven.run_until(crate::system(), async move {
+        let gk = crate::ArcGoalkeeper::new();
+        runtime.block_on(driven.run_until(&gk, async move {
             // Two tasks on one handle, as a connection and its streams are.
             let shared = SharedPriority::new(Priority::New);
             let tasks: Vec<_> = (0..2)
@@ -1101,7 +1104,8 @@ mod tests {
             .unwrap();
         let driven = executor.clone();
         let ex = executor.clone();
-        runtime.block_on(driven.run_until(crate::system(), async move {
+        let gk = crate::ArcGoalkeeper::new();
+        runtime.block_on(driven.run_until(&gk, async move {
             // One handle, so every move is all of them at once and the window
             // is as wide as this can make it.
             let shared = SharedPriority::new(Priority::New);
@@ -1192,7 +1196,8 @@ mod tests {
             .unwrap();
         let driven = executor.clone();
         let ex = executor.clone();
-        let out = runtime.block_on(driven.run_until(crate::system(), async move {
+        let gk = crate::ArcGoalkeeper::new();
+        let out = runtime.block_on(driven.run_until(&gk, async move {
             let priority = SharedPriority::new(Priority::Accept);
             let moved = priority.clone();
             let task = ex.spawn_with(priority, async { 5u32 });
@@ -1220,7 +1225,8 @@ mod tests {
             .unwrap();
         let driven = executor.clone();
         let ex = executor.clone();
-        runtime.block_on(driven.run_until(crate::system(), async move {
+        let gk = crate::ArcGoalkeeper::new();
+        runtime.block_on(driven.run_until(&gk, async move {
             let mut tasks = Vec::new();
             for i in 0..200 {
                 let p = if i % 2 == 0 {

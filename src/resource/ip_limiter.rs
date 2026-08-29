@@ -410,7 +410,12 @@ impl Addresses {
     /// Returns the address rather than a guard, since a guard must carry the
     /// handle that issued it and this runs inside the lock. The caller wraps
     /// it.
-    pub(crate) fn connection_permit(&mut self, ip: IpAddr, label: &'static str) -> Option<IpAddr> {
+    pub(crate) fn connection_permit(
+        &mut self,
+        ip: IpAddr,
+        label: &'static str,
+        strained: bool,
+    ) -> Option<IpAddr> {
         self.permits = self.permits.saturating_add(1);
         let now = Instant::now();
         let config = self.config;
@@ -438,10 +443,10 @@ impl Addresses {
             return None;
         }
 
-        // Read rather than stored, so it reflects the newest window rather than
-        // whenever the application last reported.
-        let soft_limit_reached = crate::resource::strained()
-            || self.total_connections >= config.total_connections_soft_limit;
+        // `strained` is this instance's verdict, read by the caller before it
+        // took this lock; see [`crate::ProvideGoalkeeper::connection_permit`].
+        let soft_limit_reached =
+            strained || self.total_connections >= config.total_connections_soft_limit;
         if soft_limit_reached {
             self.last_soft_limit = Some(now);
         }
@@ -539,22 +544,22 @@ impl Addresses {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ArcGoalkeeper;
 
-    /// Tests share one global limiter, so they use distinct addresses rather
-    /// than distinct limiters.
+    /// An address, for a case that needs one.
     fn ip(n: u16) -> IpAddr {
         IpAddr::from([10, 0, (n >> 8) as u8, n as u8])
     }
 
     #[test]
     fn an_address_may_connect_and_the_permit_frees_its_slot() {
-        let before = SystemGoalkeeper.total_connections();
-        let permit = SystemGoalkeeper
+        let gk = ArcGoalkeeper::new();
+        let permit = gk
             .connection_permit(ip(1), "test")
             .expect("first connection");
-        assert_eq!(SystemGoalkeeper.total_connections(), before + 1);
+        assert_eq!(gk.total_connections(), 1);
         drop(permit);
-        assert_eq!(SystemGoalkeeper.total_connections(), before);
+        assert_eq!(gk.total_connections(), 0);
     }
 
     #[test]
@@ -582,59 +587,58 @@ mod tests {
 
     #[test]
     fn bandwidth_is_recorded_and_read_back_per_direction() {
+        let gk = ArcGoalkeeper::new();
         let address = ip(2);
 
         // Sent as traffic rather than as one number, since a token bucket
         // always admits the first spend and charges it forward. Three
         // megabytes, against the shipped 500KB/s.
-        //
-        // Not `configure`d, so this does not race the tests that are: the
-        // assertions below hold under any configuration at least as tight as
-        // the default.
         let flood = |dir| {
             for _ in 0..10 {
-                SystemGoalkeeper.record_address_bandwidth(address, dir, 300_000);
+                gk.record_address_bandwidth(address, dir, 300_000);
             }
         };
 
         assert!(
-            !SystemGoalkeeper.address_over_bandwidth(address, Direction::Rx),
+            !gk.address_over_bandwidth(address, Direction::Rx),
             "nothing sent yet"
         );
         flood(Direction::Rx);
-        assert!(SystemGoalkeeper.address_over_bandwidth(address, Direction::Rx));
+        assert!(gk.address_over_bandwidth(address, Direction::Rx));
         // What the peer sent says nothing about what we sent it, so an upload
         // flood must not throttle the downstream.
         assert!(
-            !SystemGoalkeeper.address_over_bandwidth(address, Direction::Tx),
+            !gk.address_over_bandwidth(address, Direction::Tx),
             "Rx must not spend Tx's allowance"
         );
 
         // And the same the other way, so neither direction is privileged.
         flood(Direction::Tx);
-        assert!(SystemGoalkeeper.address_over_bandwidth(address, Direction::Tx));
+        assert!(gk.address_over_bandwidth(address, Direction::Tx));
     }
 
     #[test]
     fn an_unknown_address_is_not_over_anything() {
-        assert!(!SystemGoalkeeper.address_over_bandwidth(ip(3), Direction::Tx));
-        assert!(!SystemGoalkeeper.address_over_bandwidth(ip(3), Direction::Rx));
+        let gk = ArcGoalkeeper::new();
+        assert!(!gk.address_over_bandwidth(ip(3), Direction::Tx));
+        assert!(!gk.address_over_bandwidth(ip(3), Direction::Rx));
     }
 
     #[test]
     fn sessions_are_counted_while_held() {
+        let gk = ArcGoalkeeper::new();
         let address = ip(4);
         let seen = |target: IpAddr| {
             let mut actives = 0;
-            SystemGoalkeeper.address_stats(|ip, s| {
+            gk.address_stats(|ip, s| {
                 if ip == target {
                     actives = s.active_sessions;
                 }
             });
             actives
         };
-        let a = SystemGoalkeeper.active_session(address);
-        let b = SystemGoalkeeper.active_session(address);
+        let a = gk.active_session(address);
+        let b = gk.active_session(address);
         assert_eq!(seen(address), 2);
         drop(a);
         assert_eq!(seen(address), 1);

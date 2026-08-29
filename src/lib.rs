@@ -77,11 +77,26 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 /// The process's one instance, behind [`SystemGoalkeeper`].
-static SYSTEM: LazyLock<Goalkeeper> = LazyLock::new(Goalkeeper::default);
+///
+/// A unit test that reaches this shares one limiter with every other test in
+/// its binary, so their counts, ledgers and pressure bleed together and an
+/// assertion passes or fails by running order. The initializer panics under
+/// `cfg(test)` to forbid it: a test wanting an instance constructs its own with
+/// [`ArcGoalkeeper::new`]. Integration tests, examples and benches build the
+/// crate without that cfg and get the real instance, since they exercise the
+/// process-wide thing on purpose.
+static SYSTEM: LazyLock<Goalkeeper> = LazyLock::new(system_init);
 
-/// The process's instance, for the modules that still address it directly.
-pub(crate) fn system() -> &'static Goalkeeper {
-    &SYSTEM
+#[cfg(test)]
+fn system_init() -> Goalkeeper {
+    panic!(
+        "a unit test used the process-wide Goalkeeper; construct an ArcGoalkeeper::new() instead"
+    )
+}
+
+#[cfg(not(test))]
+fn system_init() -> Goalkeeper {
+    Goalkeeper::default()
 }
 
 /// Everything the crate rations, for one process or one test.
@@ -142,9 +157,14 @@ pub trait ProvideGoalkeeper:
     /// means refuse. `label` names the transport for the warning log, e.g.
     /// `"TCP connection"`.
     fn connection_permit(&self, ip: IpAddr, label: &'static str) -> Option<ConnectionPermit<Self>> {
+        // Read before the limiter lock, never inside it: the ledger takes the
+        // pressure lock when it rolls a window, so taking them the other way
+        // round here would be a lock-order inversion. Passed in rather than
+        // read from within, so the limiter answers about this instance.
+        let strained = self.strained();
         let ip = self
             .limiter
-            .with(|limiter| limiter.connection_permit(ip, label))?;
+            .with(|limiter| limiter.connection_permit(ip, label, strained))?;
         Some(ConnectionPermit::new(ip, self.clone()))
     }
 
@@ -368,17 +388,55 @@ impl Goalkeeper {
     }
 
     /// Pressure at which the process is considered strained, and at which it
-    /// stops being.
+    /// stops being, applied to every axis at once.
     ///
     /// The second is lower, since shedding load lowers pressure, which would
-    /// re-admit and raise it again. The gap is what makes it settle.
+    /// re-admit and raise it again. The gap is what makes it settle; `enter`
+    /// below `leave` is a bug and asserts in debug.
     ///
-    /// Default: `0.75`, `0.5`
+    /// Each axis otherwise carries its own band, since they are not alike. This
+    /// flattens the three to one and so discards that distinction; to keep it,
+    /// set the axes individually with [`Self::set_cpu_pressure_thresholds`] and
+    /// its siblings.
+    ///
+    /// Default: CPU `0.925`/`0.875`, RAM `0.8`/`0.75`, network `0.925`/`0.875`
     pub fn set_pressure_thresholds(&self, enter: f32, leave: f32) {
+        let band = crate::resource::Thresholds::new(enter, leave);
         crate::resource::set_config(self, |config| {
-            config.enter = enter;
-            config.leave = leave;
+            config.cpu = band;
+            config.ram = band;
+            config.network = band;
         });
+    }
+
+    /// The strain band for scheduling lateness alone. See
+    /// [`Self::set_pressure_thresholds`] for the shape of the pair.
+    ///
+    /// Default: `0.925`/`0.875`
+    pub fn set_cpu_pressure_thresholds(&self, enter: f32, leave: f32) {
+        let band = crate::resource::Thresholds::new(enter, leave);
+        crate::resource::set_config(self, |config| config.cpu = band);
+    }
+
+    /// The strain band for memory alone. See
+    /// [`Self::set_pressure_thresholds`] for the shape of the pair.
+    ///
+    /// Default: `0.8`/`0.75`
+    pub fn set_ram_pressure_thresholds(&self, enter: f32, leave: f32) {
+        let band = crate::resource::Thresholds::new(enter, leave);
+        crate::resource::set_config(self, |config| config.ram = band);
+    }
+
+    /// The strain band for the bandwidth budget alone. See
+    /// [`Self::set_pressure_thresholds`] for the shape of the pair.
+    ///
+    /// The budget is set under the wire, so a value over one is a link over its
+    /// budget rather than over its capacity; a band may sit there deliberately.
+    ///
+    /// Default: `0.925`/`0.875`
+    pub fn set_network_pressure_thresholds(&self, enter: f32, leave: f32) {
+        let band = crate::resource::Thresholds::new(enter, leave);
+        crate::resource::set_config(self, |config| config.network = band);
     }
 
     /// How long a verdict stands before it may flip, however the samples move.

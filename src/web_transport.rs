@@ -23,7 +23,7 @@ use crate::executor::priority::{Priority, SharedPriority};
 use crate::http::tls::TlsConfig;
 use crate::resource::bandwidth::{self, Direction};
 use crate::resource::handshake;
-use crate::{ProvideGoalkeeper, SystemGoalkeeper};
+use crate::{Goalkeeper, ProvideGoalkeeper, SystemGoalkeeper};
 use log::warn;
 use std::cell::RefCell;
 use std::future::Future;
@@ -359,7 +359,7 @@ where
                     continue;
                 }
                 _ = sample.tick() => {
-                    sampler.sample();
+                    sampler.sample(&self.provider);
                     continue;
                 }
             };
@@ -816,12 +816,15 @@ struct Sampler {
 }
 
 impl Sampler {
-    fn sample(&mut self) {
+    /// Records against `gk`, the instance this endpoint belongs to, rather than
+    /// the process's: an endpoint on an [`ArcGoalkeeper`][crate::ArcGoalkeeper]
+    /// must not charge its wire totals to the system ledger.
+    fn sample(&mut self, gk: &Goalkeeper) {
         // The socket meter is an aggregate and connections report themselves,
         // so the difference is traffic belonging to no connection, which is
         // precisely the attack traffic.
-        bandwidth::record_socket_total(Direction::Tx, self.tx.load(Ordering::Relaxed));
-        bandwidth::record_socket_total(Direction::Rx, self.rx.load(Ordering::Relaxed));
+        bandwidth::record_socket_total_of(gk, Direction::Tx, self.tx.load(Ordering::Relaxed));
+        bandwidth::record_socket_total_of(gk, Direction::Rx, self.rx.load(Ordering::Relaxed));
     }
 }
 

@@ -538,7 +538,7 @@ impl<P: ProvideGoalkeeper> AsyncRead for ConnIo<P> {
         // it slows at the source rather than discovering the limit when our
         // socket buffer fills.
         let index = Direction::Rx as usize;
-        let epoch = bandwidth::epoch();
+        let epoch = bandwidth::epoch_of(this.conn.provider());
         if this.applied.epoch[index] != Some(epoch) {
             // A connection re-levelled since the last window takes its memory
             // with it. Here, because this is the one place a live connection
@@ -556,7 +556,8 @@ impl<P: ProvideGoalkeeper> AsyncRead for ConnIo<P> {
             this.applied.kernel[index] = match crate::tokio_net::round_trip(&this.stream) {
                 Some(rtt) => {
                     let ration = bandwidth::ration(this.conn, Direction::Rx);
-                    let flight = bandwidth::flight(ration, bandwidth::window(), rtt);
+                    let flight =
+                        bandwidth::flight(ration, bandwidth::window_of(this.conn.provider()), rtt);
                     let room = crate::resource::memory::window_ceiling(this.conn);
                     let clamp = crate::resource::memory::quantise(flight.min(room))
                         .clamp(MIN_CLAMP, MAX_CLAMP) as u32;
@@ -607,7 +608,7 @@ impl<P: ProvideGoalkeeper> AsyncWrite for ConnIo<P> {
         // Nagle goes with it: a connection keeping up wants its writes out now,
         // but one held to a low rate is better off coalescing them.
         let index = Direction::Tx as usize;
-        let epoch = bandwidth::epoch();
+        let epoch = bandwidth::epoch_of(this.conn.provider());
         if this.applied.epoch[index] != Some(epoch) {
             let rate = bandwidth::paced_rate(this.conn, Direction::Tx);
             this.applied.kernel[index] = crate::tokio_net::pace(&this.stream, rate);
@@ -853,20 +854,24 @@ impl<S: AsyncWrite, P: ProvideGoalkeeper> AsyncWrite for Throttled<S, P> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ArcGoalkeeper;
     use std::net::Ipv6Addr;
-    use std::sync::atomic::AtomicU16;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    /// A fresh address per connection, since these all share
-    /// [`SystemGoalkeeper`]'s limiter and must not ration each other.
-    fn conn() -> (Conn, oneshot::Receiver<()>) {
-        static NEXT: AtomicU16 = AtomicU16::new(1);
-        let n = NEXT.fetch_add(1, Ordering::Relaxed);
-        let ip = IpAddr::from([10, 1, (n >> 8) as u8, n as u8]);
-        let permit = SystemGoalkeeper
+    /// A connection on an instance of its own.
+    ///
+    /// The instance is returned so it lives as long as the connection and so a
+    /// case can read back the ledgers the connection wrote. Each case gets its
+    /// own, so nothing one does rations another; a fixed address is therefore
+    /// enough.
+    fn conn() -> (ArcGoalkeeper, Conn<ArcGoalkeeper>, oneshot::Receiver<()>) {
+        let gk = ArcGoalkeeper::new();
+        let ip = IpAddr::from([10, 1, 0, 1]);
+        let permit = gk
             .connection_permit(ip, "test")
             .expect("a first connection is always permitted");
-        Conn::new(SocketAddr::new(ip, 4000), permit)
+        let (conn, killed) = Conn::new(SocketAddr::new(ip, 4000), permit);
+        (gk, conn, killed)
     }
 
     #[test]
@@ -901,7 +906,7 @@ mod tests {
     #[tokio::test]
     async fn a_stream_counts_what_passes_through_it() {
         let (client, server) = socket_pair().await;
-        let (conn, killed) = conn();
+        let (_gk, conn, killed) = conn();
         let mut io = ConnIo::new(server, conn.clone(), killed);
 
         let mut client = client;
@@ -918,7 +923,7 @@ mod tests {
     #[tokio::test]
     async fn killing_aborts_the_next_read() {
         let (client, server) = socket_pair().await;
-        let (conn, killed) = conn();
+        let (_gk, conn, killed) = conn();
         let mut io = ConnIo::new(server, conn.clone(), killed);
         let _client = client;
 
@@ -934,7 +939,7 @@ mod tests {
     #[tokio::test]
     async fn killing_twice_is_harmless() {
         let (_client, server) = socket_pair().await;
-        let (conn, killed) = conn();
+        let (_gk, conn, killed) = conn();
         let _io = ConnIo::new(server, conn.clone(), killed);
         conn.kill();
         conn.kill();
@@ -942,7 +947,7 @@ mod tests {
 
     #[test]
     fn a_connection_starts_as_a_stranger_and_can_be_raised() {
-        let (conn, _killed) = conn();
+        let (_gk, conn, _killed) = conn();
         assert_eq!(conn.priority().effective(), Priority::New);
         conn.set_base(Priority::User(crate::executor::priority::UserPriority::L0));
         assert_eq!(
@@ -961,14 +966,14 @@ mod tests {
     fn a_reservation_follows_its_connection_out_of_being_a_stranger() {
         use crate::executor::priority::UserPriority::L0;
 
-        let (conn, _killed) = conn();
-        let held = SystemGoalkeeper.memory_usage();
+        let (gk, conn, _killed) = conn();
+        let held = gk.memory_usage();
         let stranger_before = held.held(Priority::New);
         let player_before = held.held(Priority::User(L0));
 
         let _ram = conn.try_reserve(64 * 1024).expect("an idle ledger admits");
         assert_eq!(
-            SystemGoalkeeper.memory_usage().held(Priority::New) - stranger_before,
+            gk.memory_usage().held(Priority::New) - stranger_before,
             64 * 1024,
             "a stranger's reservation was not charged to strangers"
         );
@@ -977,7 +982,7 @@ mod tests {
         conn.set_base(Priority::User(L0));
         conn.reconcile_ram();
 
-        let after = SystemGoalkeeper.memory_usage();
+        let after = gk.memory_usage();
         assert_eq!(
             after.held(Priority::New),
             stranger_before,

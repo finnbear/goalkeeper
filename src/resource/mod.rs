@@ -62,19 +62,50 @@ impl Pressure {
     }
 }
 
+/// The band an axis strains in: pressure at which it turns on, and the lower
+/// one at which it turns off.
+///
+/// Two rather than one because shedding load lowers pressure, which a single
+/// threshold would then re-admit against and raise again. The gap is the
+/// hysteresis that makes a verdict settle.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub(crate) struct Thresholds {
+    pub enter: f32,
+    pub leave: f32,
+}
+
+impl Thresholds {
+    /// A band, checking the invariant every setter depends on.
+    ///
+    /// `enter` at or above `leave`: the verdict turns on at `enter` and off only
+    /// below the lower `leave`, so the two crossing would turn it on and
+    /// immediately want it off, which is the chatter the gap exists to prevent.
+    pub(crate) fn new(enter: f32, leave: f32) -> Self {
+        debug_assert!(
+            enter >= leave,
+            "pressure enter ({enter}) must be at or above leave ({leave})"
+        );
+        Self { enter, leave }
+    }
+}
+
 /// How pressure is derived and when it bites.
 ///
 /// Set through [`crate::Goalkeeper`]'s per-field setters rather than as a
 /// struct, so changing one number cannot silently revert another.
-#[derive(Copy, Clone, Debug)]
+///
+/// The thresholds are per axis because the axes are not alike: a link a tenth
+/// over its budget is routine, where a CPU a tenth over its schedule is a tick
+/// already missed. Each carries its own band; the dwell and the smoothing are
+/// one policy over all three.
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub(crate) struct Config {
-    /// Pressure at which the process is considered strained.
-    pub enter: f32,
-    /// Pressure at which it stops being considered strained.
-    ///
-    /// Lower than [`Self::enter`], since shedding load lowers pressure, which
-    /// would re-admit and raise it again. The gap is what makes it settle.
-    pub leave: f32,
+    /// Scheduling lateness.
+    pub cpu: Thresholds,
+    /// How close memory is to its ceiling.
+    pub ram: Thresholds,
+    /// How much of the bandwidth budget is spent.
+    pub network: Thresholds,
     /// How long a verdict stands before it may flip, however the samples move.
     ///
     /// Guards the same oscillation from the other side, and hides a single
@@ -90,8 +121,26 @@ pub(crate) struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            enter: 0.925,
-            leave: 0.875,
+            // A missed tick is imminent well before the schedule is a whole
+            // window late, and the band is tight because lateness is the axis
+            // the whole crate exists to defend.
+            cpu: Thresholds {
+                enter: 0.925,
+                leave: 0.875,
+            },
+            // Memory has no backpressure of its own, so it is acted on earlier
+            // than the link, since the alternative to acting is the allocator
+            // failing.
+            ram: Thresholds {
+                enter: 0.8,
+                leave: 0.75,
+            },
+            // The budget is deliberately under the wire, so this bites a little
+            // before the link itself would.
+            network: Thresholds {
+                enter: 0.925,
+                leave: 0.875,
+            },
             dwell: Duration::from_secs(1),
             // At one sample per 100ms window, roughly a one-second memory.
             smoothing: 0.25,
@@ -114,8 +163,11 @@ pub(crate) struct State {
     /// a TTL a link that saturates and then goes silent would leave its last
     /// reading standing forever.
     network_at: Option<Instant>,
-    /// The current verdict, and when it last changed.
-    strained: Verdict,
+    /// One hysteretic verdict per axis, each against its own band. The strained
+    /// verdict is the disjunction of them; see [`State::settle`].
+    cpu: Verdict,
+    ram: Verdict,
+    network: Verdict,
     /// Where the handshake pool has glided to, in `0..=1`.
     ///
     /// A continuous position rather than a verdict, so the pool travels between
@@ -123,19 +175,14 @@ pub(crate) struct State {
     /// evict a burst of handshakes that were about to finish, costing exactly
     /// the CPU the tightening meant to save.
     ///
-    /// Driven by [`Pressure::worst_compute`], so a saturated link does not move
-    /// it and a short memory does.
+    /// Driven by the compute axes, CPU and memory, so a saturated link does not
+    /// move it and a short memory does.
     compute_glide: f32,
     /// The share of the gap closed per tick. Asymmetric in use; see [`glide`].
     glide_step: f32,
-    /// The same as [`Self::strained`], over [`Pressure::worst_compute`].
-    ///
-    /// A verdict of its own, since sharing the hysteresis would let a busy link
-    /// hold the crypto pool small after the CPU had recovered, or the reverse.
-    compute_strained: Verdict,
 }
 
-/// A hysteretic yes-or-no over some measure of pressure.
+/// A hysteretic yes-or-no over one axis of pressure.
 #[derive(Copy, Clone, Default)]
 struct Verdict {
     on: bool,
@@ -150,18 +197,18 @@ impl Verdict {
         }
     }
 
-    /// Re-decides, honouring both thresholds and the dwell.
-    fn settle(&mut self, now: Instant, worst: f32, config: &Config) {
+    /// Re-decides against this axis's band, honouring the dwell.
+    fn settle(&mut self, now: Instant, value: f32, band: &Thresholds, dwell: Duration) {
         let wants = if self.on {
-            worst >= config.leave
+            value >= band.leave
         } else {
-            worst >= config.enter
+            value >= band.enter
         };
         if wants == self.on {
             return;
         }
         if let Some(since) = self.since
-            && now.saturating_duration_since(since) < config.dwell
+            && now.saturating_duration_since(since) < dwell
         {
             return;
         }
@@ -177,14 +224,9 @@ impl Default for State {
 }
 
 impl State {
-    const fn new() -> Self {
+    fn new() -> Self {
         Self {
-            config: Config {
-                enter: 0.75,
-                leave: 0.5,
-                dwell: Duration::from_secs(1),
-                smoothing: 0.25,
-            },
+            config: Config::default(),
             internal: Pressure {
                 cpu: 0.0,
                 network: 0.0,
@@ -196,10 +238,11 @@ impl State {
                 ram: 0.0,
             },
             network_at: None,
+            cpu: Verdict::new(),
+            ram: Verdict::new(),
+            network: Verdict::new(),
             compute_glide: 0.0,
             glide_step: 0.25,
-            strained: Verdict::new(),
-            compute_strained: Verdict::new(),
         }
     }
 
@@ -223,12 +266,25 @@ impl State {
         *slot = *slot * (1.0 - alpha) + sample * alpha;
     }
 
-    /// Re-decides both verdicts.
+    /// Re-decides each axis against its own band.
     fn settle(&mut self, now: Instant) {
         let combined = self.combined(now);
-        self.strained.settle(now, combined.worst(), &self.config);
-        self.compute_strained
-            .settle(now, combined.worst_compute(), &self.config);
+        let dwell = self.config.dwell;
+        self.cpu.settle(now, combined.cpu, &self.config.cpu, dwell);
+        self.ram.settle(now, combined.ram, &self.config.ram, dwell);
+        self.network
+            .settle(now, combined.network, &self.config.network, dwell);
+    }
+
+    /// Strained if any axis is: the process tightens on the worst of them.
+    fn strained(&self) -> bool {
+        self.cpu.on || self.ram.on || self.network.on
+    }
+
+    /// The same over the compute axes alone, since a saturated link says
+    /// nothing about whether there is a core to finish a handshake with.
+    fn compute_strained(&self) -> bool {
+        self.cpu.on || self.ram.on
     }
 }
 
@@ -272,7 +328,7 @@ pub(crate) fn strained_of(gk: &Goalkeeper) -> bool {
     let now = Instant::now();
     with_of(gk, |state| {
         state.settle(now);
-        state.strained.on
+        state.strained()
     })
 }
 
@@ -281,13 +337,8 @@ pub(crate) fn compute_strained_of(gk: &Goalkeeper) -> bool {
     let now = Instant::now();
     with_of(gk, |state| {
         state.settle(now);
-        state.compute_strained.on
+        state.compute_strained()
     })
-}
-
-/// The process's verdict, for the internals that have no handle to hand.
-pub(crate) fn strained() -> bool {
-    strained_of(crate::system())
 }
 
 /// Reports how late the schedule is running, as a fraction of one window.
@@ -319,8 +370,14 @@ pub(crate) fn record_cpu_sample_of(gk: &Goalkeeper, late: Duration, window: Dura
 pub(crate) fn glide(gk: &Goalkeeper) {
     let now = Instant::now();
     with_of(gk, |state| {
-        let enter = state.config.enter.max(0.01);
-        let target = (state.combined(now).worst_compute() / enter).clamp(0.0, 1.0);
+        // How far each compute axis has come toward its own `enter`, worst
+        // first. Per axis rather than one threshold, since CPU and memory strain
+        // at different levels; the link is left out, as it does not size crypto.
+        let combined = state.combined(now);
+        let toward = |value: f32, band: &Thresholds| value / band.enter.max(0.01);
+        let target = toward(combined.cpu, &state.config.cpu)
+            .max(toward(combined.ram, &state.config.ram))
+            .clamp(0.0, 1.0);
         let step = if target > state.compute_glide {
             state.glide_step
         } else {
@@ -375,11 +432,6 @@ pub(crate) fn record_network_sample_of(gk: &Goalkeeper, spent: f32) {
     });
 }
 
-/// The process's, for the ledger as it rolls.
-pub(crate) fn record_network_sample(spent: f32) {
-    record_network_sample_of(crate::system(), spent);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -399,6 +451,47 @@ mod tests {
         gk.set_user_cpu_pressure(p.cpu);
         gk.set_user_network_pressure(p.network);
         gk.set_user_ram_pressure(p.ram);
+    }
+
+    /// The running state and the [`Default`] agree on the thresholds.
+    ///
+    /// They were once written out twice, and the copies drifted: raising the
+    /// threshold on the [`Default`] left a fresh instance on the old one, so a
+    /// process was strained at a level the configuration said was fine.
+    #[test]
+    fn a_fresh_state_carries_the_default_thresholds() {
+        assert_eq!(State::new().config, Config::default());
+    }
+
+    /// Each axis's band is set on its own, leaving the others alone.
+    #[test]
+    fn per_axis_thresholds_do_not_touch_the_other_axes() {
+        let gk = goalkeeper();
+        let default = Config::default();
+
+        gk.set_ram_pressure_thresholds(0.6, 0.5);
+        with_of(&gk, |state| {
+            assert_eq!(state.config.ram, Thresholds::new(0.6, 0.5));
+            assert_eq!(state.config.cpu, default.cpu, "cpu moved with ram");
+            assert_eq!(state.config.network, default.network, "network moved");
+        });
+
+        // And the flatten-all setter reaches every axis.
+        gk.set_pressure_thresholds(0.7, 0.55);
+        with_of(&gk, |state| {
+            let band = Thresholds::new(0.7, 0.55);
+            assert_eq!(state.config.cpu, band);
+            assert_eq!(state.config.ram, band);
+            assert_eq!(state.config.network, band);
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "must be at or above leave")]
+    fn a_band_with_enter_below_leave_is_a_bug() {
+        // Debug-only, which is where the suite runs; a release build would take
+        // the inverted band and chatter rather than assert.
+        Thresholds::new(0.5, 0.9);
     }
 
     #[test]
@@ -444,6 +537,9 @@ mod tests {
     fn the_verdict_does_not_chatter_between_the_thresholds() {
         let gk = goalkeeper();
         gk.set_pressure_dwell(Duration::ZERO);
+        // Set here rather than leaned on, so this tests the gap between the two
+        // thresholds and not whatever the default happens to be.
+        gk.set_pressure_thresholds(0.75, 0.5);
 
         // Over `enter`, so it engages.
         set_user_pressure_all(
@@ -479,6 +575,7 @@ mod tests {
     fn the_dwell_holds_a_verdict_briefly() {
         let gk = goalkeeper();
         gk.set_pressure_dwell(Duration::from_secs(30));
+        gk.set_pressure_thresholds(0.75, 0.5);
         set_user_pressure_all(
             &gk,
             Pressure {
@@ -501,7 +598,7 @@ mod tests {
         // as sustained overload.
         record_cpu_sample_of(&gk, window, window);
         assert!(
-            gk.internal_pressure().cpu < Config::default().enter,
+            gk.internal_pressure().cpu < Config::default().cpu.enter,
             "a lone stall crossed the threshold on its own"
         );
 
@@ -509,7 +606,7 @@ mod tests {
         for _ in 0..20 {
             record_cpu_sample_of(&gk, window, window);
         }
-        assert!(gk.internal_pressure().cpu >= Config::default().enter);
+        assert!(gk.internal_pressure().cpu >= Config::default().cpu.enter);
     }
 
     #[test]
@@ -518,7 +615,7 @@ mod tests {
         for _ in 0..20 {
             record_network_sample_of(&gk, 1.0);
         }
-        assert!(gk.internal_pressure().network >= Config::default().enter);
+        assert!(gk.internal_pressure().network >= Config::default().network.enter);
         assert_eq!(gk.internal_pressure().cpu, 0.0, "axes are independent");
     }
 

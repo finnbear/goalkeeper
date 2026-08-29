@@ -141,7 +141,7 @@ pub(crate) fn record_raw(gk: &Goalkeeper, level: u8, ip: IpAddr, dir: Direction,
     let now = Instant::now();
     gk.limiter.with_process(|limiter, ledger, _| {
         let config = ledger.config;
-        ledger.roll(now, &config);
+        ledger.roll(gk, now, &config);
         let level = level as usize;
         match dir {
             Direction::Tx => ledger.tx[level] = ledger.tx[level].saturating_add(bytes),
@@ -168,7 +168,7 @@ pub(crate) fn tick_of(gk: &Goalkeeper) {
     let now = Instant::now();
     gk.limiter.with_process(|_, ledger, _| {
         let config = ledger.config;
-        ledger.roll(now, &config);
+        ledger.roll(gk, now, &config);
     });
 }
 
@@ -216,7 +216,7 @@ pub(crate) fn settle_raw(gk: &Goalkeeper, grant: Grant, ip: IpAddr, dir: Directi
     let now = Instant::now();
     gk.limiter.with_process(|limiter, ledger, _| {
         let config = ledger.config;
-        ledger.roll(now, &config);
+        ledger.roll(gk, now, &config);
 
         let at = (grant.level as usize).min(Priority::LEVELS - 1);
         let counts = match dir {
@@ -277,7 +277,7 @@ pub(crate) fn lease<P: ProvideGoalkeeper>(
     let outcome = conn.provider().limiter.with_process(|limiter, ledger, _| {
         let over_ip = limiter.over_bandwidth(conn.ip(), dir);
         let config = ledger.config;
-        ledger.roll(now, &config);
+        ledger.roll(conn.provider(), now, &config);
         let remaining = ledger.remaining(level, dir, &config);
 
         if !over_ip && remaining > 0 {
@@ -349,11 +349,6 @@ pub(crate) fn window_of(gk: &Goalkeeper) -> Duration {
     gk.limiter.with_process(|_, ledger, _| ledger.config.window)
 }
 
-/// The process's, for the internals that have no handle to hand.
-pub(crate) fn window() -> Duration {
-    window_of(crate::system())
-}
-
 /// Which window the ledger is in.
 ///
 /// For a caller that reconfigures something once per window rather than once
@@ -363,14 +358,9 @@ pub(crate) fn epoch_of(gk: &Goalkeeper) -> u64 {
     let now = Instant::now();
     gk.limiter.with_process(|_, ledger, _| {
         let config = ledger.config;
-        ledger.roll(now, &config);
+        ledger.roll(gk, now, &config);
         ledger.epoch
     })
-}
-
-/// The process's, for the internals that have no handle to hand.
-pub(crate) fn epoch() -> u64 {
-    epoch_of(crate::system())
 }
 
 /// The rate the kernel should be told to hold this connection to: what
@@ -380,7 +370,7 @@ pub(crate) fn epoch() -> u64 {
 /// Zero is not usable: `SO_MAX_PACING_RATE` reads it as unpaced, which would
 /// release a throttled connection rather than restrain it.
 pub(crate) fn paced_rate<P: ProvideGoalkeeper>(conn: &Conn<P>, dir: Direction) -> u64 {
-    let window = window().as_secs_f64();
+    let window = window_of(conn.provider()).as_secs_f64();
     let remaining = ration(conn, dir);
     let rate = if window > 0.0 {
         (remaining as f64 / window) as u64
@@ -424,7 +414,7 @@ pub(crate) fn allowance<P: ProvideGoalkeeper>(conn: &Conn<P>, dir: Direction) ->
     let now = Instant::now();
     conn.provider().limiter.with_process(|_, ledger, _| {
         let config = ledger.config;
-        ledger.roll(now, &config);
+        ledger.roll(conn.provider(), now, &config);
         ledger.allowance(level, dir, &config)
     })
 }
@@ -439,7 +429,7 @@ pub(crate) fn ration<P: ProvideGoalkeeper>(conn: &Conn<P>, dir: Direction) -> u6
     let now = Instant::now();
     conn.provider().limiter.with_process(|_, ledger, _| {
         let config = ledger.config;
-        ledger.roll(now, &config);
+        ledger.roll(conn.provider(), now, &config);
         ledger.remaining(level, dir, &config)
     })
 }
@@ -470,11 +460,10 @@ pub(crate) fn throttled<P: ProvideGoalkeeper>(
 /// The remainder is this total minus what connections reported, so the two are
 /// subtracted rather than added and cannot double count.
 #[cfg(feature = "web_transport")]
-pub(crate) fn record_socket_total(dir: Direction, total: u64) {
+pub(crate) fn record_socket_total_of(gk: &Goalkeeper, dir: Direction, total: u64) {
     let now = Instant::now();
-    crate::system()
-        .limiter
-        .with_process(|_, inner, _| inner.record_socket_total(dir, total, now));
+    gk.limiter
+        .with_process(|_, inner, _| inner.record_socket_total(gk, dir, total, now));
 }
 
 /// What the ledger has seen this window, for whoever reports on the process.
@@ -603,9 +592,9 @@ impl Ledger {
     /// process-wide ledger and the wall clock, and the property worth asserting
     /// is about what happens *across* a window boundary.
     #[cfg_attr(not(feature = "web_transport"), allow(dead_code))]
-    fn record_socket_total(&mut self, dir: Direction, total: u64, now: Instant) {
+    fn record_socket_total(&mut self, gk: &Goalkeeper, dir: Direction, total: u64, now: Instant) {
         let config = self.config;
-        self.roll(now, &config);
+        self.roll(gk, now, &config);
         // `total` counts the socket's whole life, while everything else here is
         // one window, so what this window carried is the growth since the last
         // sample. Comparing the lifetime figure against a per-window one
@@ -643,7 +632,11 @@ impl Ledger {
         }
     }
 
-    fn roll(&mut self, now: Instant, config: &Config) {
+    /// `gk` is the instance this ledger belongs to, threaded in only so the
+    /// window's network sample lands on that instance's pressure rather than the
+    /// process's. A [`Ledger`] has no back-reference to its [`Goalkeeper`], and
+    /// on an [`ArcGoalkeeper`][crate::ArcGoalkeeper] the two are not the same.
+    fn roll(&mut self, gk: &Goalkeeper, now: Instant, config: &Config) {
         let started = *self.started.get_or_insert(now);
         if now.saturating_duration_since(started) < config.window {
             return;
@@ -652,7 +645,7 @@ impl Ledger {
         // Reported before the counters are cleared, since this describes the
         // window that just ended. Whichever direction came closer to the budget
         // is the one that says how strained the link is.
-        crate::resource::record_network_sample(self.spent(config));
+        crate::resource::record_network_sample_of(gk, self.spent(config));
 
         // Advanced by whole windows rather than set to `now`, so the schedule
         // stays on a fixed grid. Rolling to `now` would make every window
@@ -848,7 +841,16 @@ impl Strikes {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ArcGoalkeeper;
     use crate::executor::priority::UserPriority::*;
+
+    /// A throwaway instance for the socket-total cases, which drive a standalone
+    /// [`Ledger`] and assert on it directly. [`Ledger::record_socket_total`]
+    /// wants a [`Goalkeeper`] only to route a window's network sample; these do
+    /// not read that, so a fresh instance keeps the sample off any shared state.
+    fn gk() -> ArcGoalkeeper {
+        ArcGoalkeeper::new()
+    }
 
     fn config() -> Config {
         Config {
@@ -1013,10 +1015,11 @@ mod tests {
     #[test]
     fn unattributed_traffic_is_the_remainder_and_is_not_double_counted() {
         // Connections reported 700 of the 1000 the socket actually moved.
+        let gk = gk();
         let mut inner = socket_ledger();
         inner.tx[Priority::User(L0).level() as usize] = 700;
         inner.attributed_tx = 700;
-        inner.record_socket_total(Direction::Tx, 1000, start());
+        inner.record_socket_total(&gk, Direction::Tx, 1000, start());
         assert_eq!(inner.tx[Priority::New.level() as usize], 300);
         let sum: u64 = inner.tx.iter().sum();
         assert_eq!(sum, 1000, "the parts add up to the whole exactly once");
@@ -1057,18 +1060,19 @@ mod tests {
     /// the window's own bytes are the same number.
     #[test]
     fn only_the_bytes_since_the_last_sample_are_charged() {
+        let gk = gk();
         let window = config().window;
         let mut inner = socket_ledger();
 
         // First window: the socket has moved 400 bytes in its life, all of them
         // during this window.
-        inner.record_socket_total(Direction::Tx, 400, start());
+        inner.record_socket_total(&gk, Direction::Tx, 400, start());
         assert_eq!(inner.tx[Priority::New.level() as usize], 400);
 
         // Second window: another 400, for 800 over the two. The window is
         // still owed 400 — the earlier 400 was charged to the window it
         // happened in, and that window is over.
-        inner.record_socket_total(Direction::Tx, 800, start() + window);
+        inner.record_socket_total(&gk, Direction::Tx, 800, start() + window);
         assert_eq!(
             inner.tx[Priority::New.level() as usize],
             400,
@@ -1077,7 +1081,7 @@ mod tests {
 
         // And a window in which the socket moved nothing owes nothing, however
         // much it has carried before.
-        inner.record_socket_total(Direction::Tx, 800, start() + window * 2);
+        inner.record_socket_total(&gk, Direction::Tx, 800, start() + window * 2);
         assert_eq!(
             inner.tx[Priority::New.level() as usize],
             0,
@@ -1098,12 +1102,18 @@ mod tests {
         // 400 bytes a window against a budget of 1_000 is two fifths of the
         // link, and stays two fifths however long it goes on for.
         let per_window = 400u64;
+        let gk = gk();
         let mut inner = socket_ledger();
         let mut lifetime = 0u64;
 
         for window in 0..64u32 {
             lifetime += per_window;
-            inner.record_socket_total(Direction::Tx, lifetime, start() + config.window * window);
+            inner.record_socket_total(
+                &gk,
+                Direction::Tx,
+                lifetime,
+                start() + config.window * window,
+            );
             let spent = inner.spent(&config);
             assert!(
                 (spent - 0.4).abs() < 0.001,
