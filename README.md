@@ -8,15 +8,28 @@
 DoS and DDoS protection library.
 
 ## Features
-
-- [x] Rate limiting
-- [x] Connection limiting
-- [x] Bandwidth limiting
-- [x] Optional `TCP_KEEPALIVE` and `TCP_NODELAY` helper function for `tokio::net::TcpStream`
-- [x] Optional `axum` and `axum_server` support
-- [x] Logging
+- [x] Custom `tokio` executor with task priorities
+- [x] Connection count limits
+- [x] Bandwidth limits/priorities
+- [x] CPU limits/priorities
+- [x] RAM limits/priorities
+- [x] TLS handshake timeouts and concurrency limits
+- [x] TCP timeouts, pacing, delaying, and buffer limits/priorities
+- [x] HTTP timeouts and concurrency limits
+- [x] Logging (`log`)
+- [x] Metrics
 - [ ] `nftables` firewall configuration
 - [ ] OS network stack hardening
+
+## Protocols (feature flags)
+- [x] HTTP/1 and HTTP/2 (`hyper`/`axum`)
+- [x] WebSocket (`axum-tws`/`tokio-websockets`)
+- [x] WebTransport (`wtransport`/`quinn`)
+- [x] TLS for all of the above (`rustls`)
+
+## Limitations
+- Not optimized for multi-core runtimes
+- ~15% max throughput reduction
 
 ## Status
 

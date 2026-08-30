@@ -39,29 +39,45 @@ impl Debug for RateLimiterState {
 }
 
 /// The (sharable) properties of a rate limiter.
-#[derive(Debug)]
+#[derive(Copy, Clone, Debug)]
 pub struct RateLimiterProps {
     rate_limit: Duration,
     pub(crate) burst: Units,
 }
 
+impl RateLimiterProps {
+    /// How much may be spent in a burst once the steady rate is exhausted.
+    pub fn burst(&self) -> Units {
+        self.burst
+    }
+
+    /// Seconds per unit of the steady rate.
+    pub fn rate_limit(&self) -> Duration {
+        self.rate_limit
+    }
+}
+
 impl RateLimiterState {
     /// Returns `true` if the action exceeds the rate limit defined by the props and should be prevented.
+    #[inline(always)]
     pub fn should_limit_rate(&mut self, props: &RateLimiterProps) -> bool {
         self.should_limit_rate_with_now_and_usage(props, Instant::now(), 1)
     }
 
     /// Returns `true` if the `usage` actions exceed the rate limit defined by the props and should be prevented.
+    #[inline(always)]
     pub fn should_limit_rate_with_usage(&mut self, props: &RateLimiterProps, usage: Units) -> bool {
         self.should_limit_rate_with_now_and_usage(props, Instant::now(), usage)
     }
 
     /// Like [`Self::should_limit_rate`] but more efficient if you already know the current time.
+    #[inline(always)]
     pub fn should_limit_rate_with_now(&mut self, props: &RateLimiterProps, now: Instant) -> bool {
         self.should_limit_rate_with_now_and_usage(props, now, 1)
     }
 
     /// Like [`Self::should_limit_rate_with_usage`] but more efficient if you already know the current time.
+    #[inline]
     pub fn should_limit_rate_with_now_and_usage(
         &mut self,
         props: &RateLimiterProps,
@@ -82,13 +98,12 @@ impl RateLimiterState {
             false
         };
 
-        if ok {
-            if let Some(instant) = self
+        if ok
+            && let Some(instant) = self
                 .until
                 .checked_add(props.rate_limit.saturating_mul(usage))
-            {
-                self.until = instant.max(now);
-            }
+        {
+            self.until = instant.max(now);
         }
 
         !ok
