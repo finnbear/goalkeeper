@@ -1,3 +1,5 @@
+
+
 # goalkeeper
 
 [![Documentation](https://docs.rs/goalkeeper/badge.svg)](https://docs.rs/goalkeeper)
@@ -30,6 +32,7 @@ DoS and DDoS protection library.
 ## Limitations
 - Not optimized for multi-core runtimes
 - ~15% max throughput reduction
+- Requires a `nightly` toolchain
 
 ## Status
 
