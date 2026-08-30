@@ -297,7 +297,7 @@ impl Goalkeeper {
     /// Connections across all addresses before each address is afforded fewer,
     /// and before new ones are refused outright.
     ///
-    /// Default: `400`, `1000`
+    /// Default: `1000`, `2000`
     pub fn set_total_connection_limits(&self, soft: u32, hard: u32) {
         self.limiter
             .with(|limiter| limiter.set_total_connection_limits(soft, hard));

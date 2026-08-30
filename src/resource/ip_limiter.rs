@@ -63,8 +63,8 @@ impl Default for Config {
             per_active_session: 1,
             connections_per_active_p90: 1,
             connections_per_active_p99: 6,
-            total_connections_soft_limit: 400,
-            total_connections_hard_limit: 1000,
+            total_connections_soft_limit: 1000,
+            total_connections_hard_limit: 2000,
             ddos_memory: Duration::from_secs(5 * 60),
             custom: RateLimiterProps::no_limit(),
         }
