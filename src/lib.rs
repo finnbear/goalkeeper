@@ -73,6 +73,7 @@ use crate::resource::Pressure;
 use crate::resource::bandwidth::Direction;
 use crate::resource::ip_limiter::{ActiveSession, ConnectionPermit, IpStats};
 use std::net::IpAddr;
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
@@ -128,6 +129,20 @@ pub struct Goalkeeper {
     /// the application reports; read by the limiter and the handshake pool. The
     /// junction the other three meet at, which is why they share one owner.
     pub(crate) pressure: Mutex<crate::resource::State>,
+    /// Which bandwidth window the ledger is in, published for readers.
+    ///
+    /// The ledger owns this number and lives behind [`Self::limiter`]'s lock. It
+    /// is copied out here because of who asks: a governed stream asks on *every*
+    /// read and *every* write, almost always to learn that nothing has changed
+    /// and its socket needs no reconfiguring. Answering that from inside the
+    /// lock made the most frequently asked question in the crate one of the
+    /// most expensive, and put a clock read behind it besides.
+    ///
+    /// Written by the ledger as it rolls, under that lock, so it is exactly as
+    /// current as the ledger is. Read relaxed: a reader seeing the previous
+    /// window reconfigures a window late, which is what already happens to a
+    /// connection that is not polled for a window.
+    pub(crate) bandwidth_epoch: AtomicU64,
 }
 
 /// A handle to a [`Goalkeeper`], and the operations that need to know which one.

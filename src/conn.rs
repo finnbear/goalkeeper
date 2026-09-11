@@ -16,6 +16,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::sync::oneshot;
@@ -484,9 +485,18 @@ pub struct ConnIo<P: ProvideGoalkeeper = SystemGoalkeeper> {
 
 /// The socket options currently set, as far as this stream knows.
 ///
-/// Reconfigured once per bandwidth window rather than per operation, since a
+/// Recomputed once per bandwidth window rather than per operation, since a
 /// ration is a per-window quantity and a `setsockopt` on every write costs more
 /// than the precision is worth. `epoch` is what enforces that cadence.
+///
+/// Recomputing is not the same as re-applying. A window is a cadence for asking
+/// whether the answer has moved, and on a settled connection it has not: the
+/// ration is the whole of its level's allowance, window after window, so the
+/// clamp and the pacing rate come out the same every time. Handing the kernel a
+/// number it already holds is a syscall for nothing, and at ten windows a second
+/// across every connection a process carries, "for nothing" is most of what
+/// this code does. So the values are remembered and only sent when they have
+/// actually changed; see [`Applied::worth_applying`].
 #[derive(Default)]
 struct Applied {
     /// The window each direction was last configured for.
@@ -496,6 +506,44 @@ struct Applied {
     /// Parking on top would only add latency.
     kernel: [bool; 2],
     nodelay: Option<bool>,
+    /// The receive-window clamp the kernel was last given, so an unchanged one
+    /// is not given again.
+    clamp: Option<u32>,
+    /// Likewise the egress pacing rate.
+    rate: Option<u64>,
+    /// The last round trip read out of the kernel, and the window it was read
+    /// in.
+    ///
+    /// Cached because it is the one *read* on this path — `TCP_INFO` copies a
+    /// large struct out under the socket lock — and because it is the input
+    /// that moves least: a path's round trip is a property of the path, not of
+    /// this window's ration. Refreshed every [`RTT_WINDOWS`] windows, which on
+    /// the shipped cadence is under a second.
+    rtt: Option<(u64, Duration)>,
+}
+
+/// How many bandwidth windows a cached round trip is reused for.
+///
+/// The clamp is recomputed every window from the ration, which does move; only
+/// the round trip is held. Eight windows is well inside the time a path's round
+/// trip takes to change materially, and takes the `TCP_INFO` reads on an idle
+/// connection from ten a second to rather over one.
+const RTT_WINDOWS: u64 = 8;
+
+impl Applied {
+    /// Whether a newly computed value differs enough from the applied one to be
+    /// worth a syscall.
+    ///
+    /// An eighth either way. Small enough that the kernel is never holding a
+    /// number that misdescribes the ration, wide enough that a value wandering
+    /// by a byte or two — which is what a ration divided by a window does —
+    /// does not buy a syscall a window, forever, on every connection.
+    fn worth_applying(applied: Option<u64>, target: u64) -> bool {
+        let Some(applied) = applied else {
+            return true;
+        };
+        applied.abs_diff(target) > applied / 8
+    }
 }
 
 impl<P: ProvideGoalkeeper> ConnIo<P> {
@@ -553,7 +601,25 @@ impl<P: ProvideGoalkeeper> AsyncRead for ConnIo<P> {
             // only becomes one through the round trip. Without a measurement
             // there is no conversion to make, and the gate below rations
             // instead.
-            this.applied.kernel[index] = match crate::tokio_net::round_trip(&this.stream) {
+            // Read from the kernel every few windows rather than every one; see
+            // `Applied::rtt`. A cached measurement is reused in between, and the
+            // clamp is still recomputed each window, because the ration is the
+            // input that actually moves.
+            let rtt = match this.applied.rtt {
+                Some((read_in, rtt)) if epoch.wrapping_sub(read_in) < RTT_WINDOWS => Some(rtt),
+                _ => {
+                    let read = crate::tokio_net::round_trip(&this.stream);
+                    // Remembered only when there was something to remember. A
+                    // connection with no sample yet is asked again next window,
+                    // since its first sample is what starts the kernel rationing
+                    // it at all.
+                    if let Some(rtt) = read {
+                        this.applied.rtt = Some((epoch, rtt));
+                    }
+                    read
+                }
+            };
+            this.applied.kernel[index] = match rtt {
                 Some(rtt) => {
                     let ration = bandwidth::ration(this.conn, Direction::Rx);
                     let flight =
@@ -561,7 +627,21 @@ impl<P: ProvideGoalkeeper> AsyncRead for ConnIo<P> {
                     let room = crate::resource::memory::window_ceiling(this.conn);
                     let clamp = crate::resource::memory::quantise(flight.min(room))
                         .clamp(MIN_CLAMP, MAX_CLAMP) as u32;
-                    crate::tokio_net::clamp_receive_window(&this.stream, clamp)
+                    if Applied::worth_applying(this.applied.clamp.map(u64::from), u64::from(clamp))
+                    {
+                        let set = crate::tokio_net::clamp_receive_window(&this.stream, clamp);
+                        // Only a clamp the kernel took is one it is holding, so
+                        // only that is remembered — a refusal must not read as
+                        // "already applied" next window.
+                        if set {
+                            this.applied.clamp = Some(clamp);
+                        }
+                        set
+                    } else {
+                        // Unchanged, so the kernel is already holding it and the
+                        // gate below stays down.
+                        true
+                    }
                 }
                 None => false,
             };
@@ -611,7 +691,16 @@ impl<P: ProvideGoalkeeper> AsyncWrite for ConnIo<P> {
         let epoch = bandwidth::epoch_of(this.conn.provider());
         if this.applied.epoch[index] != Some(epoch) {
             let rate = bandwidth::paced_rate(this.conn, Direction::Tx);
-            this.applied.kernel[index] = crate::tokio_net::pace(&this.stream, rate);
+            // Only when it has actually moved; see `Applied`. A settled
+            // connection computes the same rate every window and the kernel is
+            // already holding it.
+            if Applied::worth_applying(this.applied.rate, rate) {
+                let set = crate::tokio_net::pace(&this.stream, rate);
+                if set {
+                    this.applied.rate = Some(rate);
+                }
+                this.applied.kernel[index] = set;
+            }
             this.applied.epoch[index] = Some(epoch);
 
             let nodelay = rate > bandwidth::MIN_PACED_RATE;
@@ -992,6 +1081,46 @@ mod tests {
             after.held(Priority::User(L0)) - player_before,
             64 * 1024,
             "the player's memory did not arrive at the player's level"
+        );
+    }
+
+    /// A settled connection stops paying for the window it is in.
+    ///
+    /// The window is a cadence for asking whether the ration has moved, not a
+    /// licence to hand the kernel the same number ten times a second. Only a
+    /// value that has actually changed is worth a syscall, and on a connection
+    /// nothing is competing with, none of them change.
+    #[test]
+    fn an_unchanged_socket_option_is_not_applied_again() {
+        // The first number applied is always worth applying: nothing is held.
+        assert!(
+            Applied::worth_applying(None, 64 * 1024),
+            "the first value must reach the kernel"
+        );
+        // The steady state: recomputed, identical, already held.
+        assert!(
+            !Applied::worth_applying(Some(64 * 1024), 64 * 1024),
+            "an unchanged value bought a syscall"
+        );
+        // Drift of the kind a ration divided by a window produces.
+        assert!(
+            !Applied::worth_applying(Some(64 * 1024), 64 * 1024 + 96),
+            "a few bytes of drift bought a syscall"
+        );
+        // A real move, in either direction.
+        assert!(
+            Applied::worth_applying(Some(64 * 1024), 32 * 1024),
+            "halving should reach the kernel"
+        );
+        assert!(
+            Applied::worth_applying(Some(64 * 1024), 128 * 1024),
+            "doubling should reach the kernel"
+        );
+        // Zero applied is not "close to" anything: a connection released from
+        // its ration has to be told.
+        assert!(
+            Applied::worth_applying(Some(0), 1),
+            "a value must reach a socket holding zero"
         );
     }
 }

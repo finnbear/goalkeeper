@@ -36,6 +36,9 @@ use std::time::{Duration, Instant};
 /// The executor is a future inside somebody's `block_on`, so while it runs the
 /// reactor does not. Returning periodically is what lets IO readiness and
 /// timers arrive. `LocalSet` caps at 61 for the same reason.
+///
+/// An upper bound, not a target: a turn also ends when the cooperative budget
+/// runs out, which under load happens first. See [`Executor::run_until`].
 const TASKS_PER_TICK: usize = 61;
 
 /// Charged on top of every poll's measured duration.
@@ -409,6 +412,9 @@ impl Executor {
             // happens on its behalf and nobody else's.
             let mut now = Instant::now();
             let mut ran = 0usize;
+            // Whether the turn ended because the cooperative budget ran out
+            // rather than because there was nothing left to run.
+            let mut spent = false;
             while ran < TASKS_PER_TICK {
                 let room = BATCH.min(TASKS_PER_TICK - ran);
                 let level = shared.pick_batch(now, &mut batch, room);
@@ -433,8 +439,29 @@ impl Executor {
                         shared.give_back(rest.by_ref());
                         break;
                     }
+
+                    // The cooperative budget is spent, so end the turn here.
+                    // See the note above the loop: a task polled past this
+                    // point does no work and pays a full redispatch for it.
+                    if !tokio::task::coop::has_budget_remaining() {
+                        shared.give_back(rest.by_ref());
+                        spent = true;
+                        break;
+                    }
                 }
                 drop(rest);
+                if spent {
+                    break;
+                }
+            }
+
+            // Ending on a spent budget is not the same as having nothing to do,
+            // and the check below only wakes when a queue is occupied. A task
+            // given back above leaves its level set, so that check does see it —
+            // but a turn that spent the budget on its very last task would
+            // otherwise sleep with a fresh budget and nothing to spend it on.
+            if spent {
+                cx.waker().wake_by_ref();
             }
 
             // More to do, but the reactor deserves a turn.
@@ -1274,6 +1301,74 @@ mod tests {
             low_ran.load(Ordering::Relaxed),
             1,
             "the starved task never ran"
+        );
+    }
+
+    /// A task is never polled with nothing left to spend.
+    ///
+    /// The turn's tasks share one cooperative budget — it is installed by the
+    /// caller's `block_on`, once per poll of `run_until` — so a turn long enough
+    /// to spend it used to go on polling anyway, and everything after that point
+    /// returned `Pending` without doing a thing. Each such poll costs a full
+    /// redispatch, so the waste rises with load and vanishes when idle, which is
+    /// exactly the shape that is hard to see in a profile.
+    ///
+    /// Asserted from inside the tasks: each records whether it *had* budget when
+    /// it was polled. Each then spends several units, as a real task does — a
+    /// `select!` over a socket, a timer and two channels is four on its own — so
+    /// a turn's worth of them is several budgets over, which is the condition
+    /// being tested. One consuming a single unit would not reach it: sixty-one
+    /// of those fit inside the hundred and twenty-eight tokio grants.
+    #[test]
+    fn a_task_is_not_polled_without_budget_to_spend() {
+        /// Budget-consuming operations per poll.
+        const OPS: usize = 8;
+        const TASKS: usize = 300;
+        let broke = Arc::new(AtomicUsize::new(0));
+        let ran = Arc::new(AtomicUsize::new(0));
+        drive(Config::default(), {
+            let broke = Arc::clone(&broke);
+            let ran = Arc::clone(&ran);
+            |ex| async move {
+                let mut tasks = Vec::new();
+                for _ in 0..TASKS {
+                    let broke = Arc::clone(&broke);
+                    let ran = Arc::clone(&ran);
+                    // A channel with everything already in it: a receive is a
+                    // budget-consuming operation that completes at once, so each
+                    // poll spends `OPS` of the turn's budget without this task
+                    // ever waiting on anything.
+                    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+                    for _ in 0..OPS {
+                        tx.send(()).unwrap();
+                    }
+                    tasks.push(ex.spawn(Priority::User(L0), async move {
+                        // Read at the top of every poll, and this future is
+                        // polled more than once — the budget may run out
+                        // part-way through, which re-queues it right here.
+                        if !tokio::task::coop::has_budget_remaining() {
+                            broke.fetch_add(1, Ordering::Relaxed);
+                        }
+                        for _ in 0..OPS {
+                            let _ = rx.recv().await;
+                        }
+                        ran.fetch_add(1, Ordering::Relaxed);
+                    }));
+                }
+                for task in tasks {
+                    task.await;
+                }
+            }
+        });
+        assert_eq!(
+            ran.load(Ordering::Relaxed),
+            TASKS,
+            "every task should have finished"
+        );
+        assert_eq!(
+            broke.load(Ordering::Relaxed),
+            0,
+            "a task was polled with the cooperative budget already spent"
         );
     }
 }

@@ -354,13 +354,16 @@ pub(crate) fn window_of(gk: &Goalkeeper) -> Duration {
 /// For a caller that reconfigures something once per window rather than once
 /// per operation, such as a socket option whose syscall costs more than the
 /// precision is worth.
+///
+/// A relaxed load of what the ledger last published, and deliberately not a
+/// lock: this is asked on every read and every write of every governed stream,
+/// and answers "nothing has changed" almost every time. Rolling the window is
+/// not this function's job — the executor does it once a window
+/// ([`tick_of`]), and every path that spends or refunds bytes does it on the
+/// way past — so a caller that only wants to know *which* window it is in need
+/// not take the lock to find out.
 pub(crate) fn epoch_of(gk: &Goalkeeper) -> u64 {
-    let now = Instant::now();
-    gk.limiter.with_process(|_, ledger, _| {
-        let config = ledger.config;
-        ledger.roll(gk, now, &config);
-        ledger.epoch
-    })
+    gk.bandwidth_epoch.load(Ordering::Relaxed)
 }
 
 /// The rate the kernel should be told to hold this connection to: what
@@ -660,6 +663,10 @@ impl Ledger {
             started + window * periods as u32
         });
         self.epoch = self.epoch.wrapping_add(1).max(1);
+        // Published for [`epoch_of`], whose callers ask far too often to be
+        // asking under this lock. Written here and nowhere else, so the two
+        // cannot disagree about which window it is.
+        gk.bandwidth_epoch.store(self.epoch, Ordering::Relaxed);
         self.tx = [0; Priority::LEVELS];
         self.rx = [0; Priority::LEVELS];
         self.attributed_tx = 0;
