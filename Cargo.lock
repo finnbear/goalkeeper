@@ -522,6 +522,7 @@ dependencies = [
  "libc",
  "log",
  "pin-project",
+ "quinn",
  "rand 0.8.5",
  "rustls",
  "socket2 0.5.10",
