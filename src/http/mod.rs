@@ -415,7 +415,7 @@ fn harden<P: ProvideGoalkeeper>(builder: &mut auto::Builder<PrioritisedExecutor<
 /// watch belong to no instance in particular, and the accept loop already holds
 /// whichever one admitted it.
 pub struct HttpServer {
-    task: Option<async_task::Task<()>>,
+    task: Option<async_task::FallibleTask<()>>,
     stop: Arc<Notify>,
     graceful: Arc<Graceful>,
 }
@@ -448,7 +448,7 @@ impl HttpServer {
 /// shutdown path.
 impl Drop for HttpServer {
     fn drop(&mut self) {
-        // `Task`'s own `Drop` cancels.
+        // `FallibleTask`'s own `Drop` cancels.
         self.task.take();
     }
 }

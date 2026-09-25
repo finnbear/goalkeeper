@@ -41,13 +41,13 @@
 
 #![cfg(all(feature = "web_socket", feature = "web_transport"))]
 
-use goalkeeper::ArcGoalkeeper;
 use goalkeeper::conn::Conn;
 use goalkeeper::executor::priority::{Priority, UserPriority};
 use goalkeeper::http::web_socket::WebSocketUpgrade;
 use goalkeeper::http::{ServeHttp, tls};
 use goalkeeper::resource::bandwidth::Direction;
 use goalkeeper::web_transport::{ServeWebTransport, Session};
+use goalkeeper::{ArcGoalkeeper, OwnedGoalkeeper};
 use rand::prelude::*;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -336,7 +336,8 @@ async fn web_transport(port: u16, polite: bool, stop: Arc<AtomicBool>) {
 fn every_ledger_drains_once_the_clients_have_gone() {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let (server_config, roots) = identity();
-    let gk = ArcGoalkeeper::new();
+    let owner = OwnedGoalkeeper::new();
+    let gk = owner.handle();
     let driven = gk.clone();
 
     tokio::runtime::Builder::new_current_thread()

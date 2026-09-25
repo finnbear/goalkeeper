@@ -442,7 +442,7 @@ where
 
 /// A running WebTransport server.
 pub struct WebTransportServer {
-    task: Option<async_task::Task<()>>,
+    task: Option<async_task::FallibleTask<()>>,
     /// An `Option` so [`Self::stop`] can drop it.
     ///
     /// quinn's endpoint driver runs for as long as any [`quinn::Endpoint`]
@@ -570,7 +570,7 @@ pub struct GovernedConnection<P: ProvideGoalkeeper = SystemGoalkeeper> {
     connection: wtransport::Connection,
     /// Handed to every stream this connection opens, so they share one ration.
     conn: Conn<P>,
-    _governor: async_task::Task<()>,
+    _governor: async_task::FallibleTask<()>,
 }
 
 impl<P: ProvideGoalkeeper> GovernedConnection<P> {
@@ -675,7 +675,7 @@ impl<P: ProvideGoalkeeper> std::ops::Deref for GovernedConnection<P> {
 pub(crate) fn govern<P: ProvideGoalkeeper>(
     connection: &wtransport::Connection,
     conn: &Conn<P>,
-) -> async_task::Task<()> {
+) -> async_task::FallibleTask<()> {
     let quic = connection.quic_connection().clone();
     let conn = conn.clone();
     let priority = conn.priority().clone();

@@ -12,7 +12,7 @@
 #![cfg(feature = "web_transport")]
 
 use goalkeeper::web_transport::{ServeWebTransport, Session};
-use goalkeeper::{ArcGoalkeeper, Goalkeeper, SystemGoalkeeper};
+use goalkeeper::{ArcGoalkeeper, Goalkeeper, OwnedGoalkeeper, SystemGoalkeeper};
 use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -247,7 +247,8 @@ fn handshakes_complete_without_a_reload() {
 #[test]
 fn an_instance_of_its_own_drives_its_own_quic() {
     let _serial = serial();
-    let gk = ArcGoalkeeper::new();
+    let owner = OwnedGoalkeeper::new();
+    let gk = owner.handle();
     stand_down(&gk);
     let (socket, port) = bound();
     let identity = identity();

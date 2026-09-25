@@ -435,14 +435,14 @@ pub(crate) fn record_network_sample_of(gk: &Goalkeeper, spent: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ArcGoalkeeper;
+    use crate::{ArcGoalkeeper, OwnedGoalkeeper};
 
     /// An instance of its own for each test.
     ///
     /// These assert on `internal`, which on the process's instance is written
     /// by the executor's lateness probe whenever another test runs a schedule.
-    fn goalkeeper() -> ArcGoalkeeper {
-        ArcGoalkeeper::new()
+    fn goalkeeper() -> OwnedGoalkeeper {
+        OwnedGoalkeeper::new()
     }
 
     /// All three axes at once, which only a test wants; the shipped setters are

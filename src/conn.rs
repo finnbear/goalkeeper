@@ -943,7 +943,7 @@ impl<S: AsyncWrite, P: ProvideGoalkeeper> AsyncWrite for Throttled<S, P> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ArcGoalkeeper;
+    use crate::{ArcGoalkeeper, OwnedGoalkeeper};
     use std::net::Ipv6Addr;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -953,8 +953,8 @@ mod tests {
     /// case can read back the ledgers the connection wrote. Each case gets its
     /// own, so nothing one does rations another; a fixed address is therefore
     /// enough.
-    fn conn() -> (ArcGoalkeeper, Conn<ArcGoalkeeper>, oneshot::Receiver<()>) {
-        let gk = ArcGoalkeeper::new();
+    fn conn() -> (OwnedGoalkeeper, Conn<ArcGoalkeeper>, oneshot::Receiver<()>) {
+        let gk = OwnedGoalkeeper::new();
         let ip = IpAddr::from([10, 1, 0, 1]);
         let permit = gk
             .connection_permit(ip, "test")

@@ -848,15 +848,15 @@ impl Strikes {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ArcGoalkeeper;
+    use crate::OwnedGoalkeeper;
     use crate::executor::priority::UserPriority::*;
 
     /// A throwaway instance for the socket-total cases, which drive a standalone
     /// [`Ledger`] and assert on it directly. [`Ledger::record_socket_total`]
     /// wants a [`Goalkeeper`] only to route a window's network sample; these do
     /// not read that, so a fresh instance keeps the sample off any shared state.
-    fn gk() -> ArcGoalkeeper {
-        ArcGoalkeeper::new()
+    fn gk() -> OwnedGoalkeeper {
+        OwnedGoalkeeper::new()
     }
 
     fn config() -> Config {

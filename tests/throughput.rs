@@ -35,7 +35,7 @@
 #![cfg(feature = "http")]
 
 use goalkeeper::executor::priority::{Priority, UserPriority};
-use goalkeeper::{ArcGoalkeeper, ProvideGoalkeeper};
+use goalkeeper::{OwnedGoalkeeper, ProvideGoalkeeper};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -83,7 +83,8 @@ async fn echo_once(listener: &TcpListener) {
 
 #[test]
 fn a_peer_is_held_to_its_receive_ration() {
-    let gk = ArcGoalkeeper::new();
+    let owner = OwnedGoalkeeper::new();
+    let gk = owner.handle();
     let driven = gk.clone();
 
     tokio::runtime::Builder::new_current_thread()

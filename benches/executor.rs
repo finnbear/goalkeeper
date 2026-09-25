@@ -23,7 +23,7 @@
 //! run on a `current_thread` runtime, since goalkeeper schedules on top of the
 //! caller's runtime rather than replacing it.
 
-use goalkeeper::ArcGoalkeeper;
+use goalkeeper::OwnedGoalkeeper;
 use goalkeeper::executor::priority::{Priority, UserPriority};
 use std::hint::black_box;
 use std::sync::Arc;
@@ -142,7 +142,8 @@ fn on_goalkeeper(n: usize) -> Report {
     let counted = Arc::clone(&done);
     // Its own instance, so what is measured is a schedule with nothing else in
     // it.
-    let gk = ArcGoalkeeper::new();
+    let owner = OwnedGoalkeeper::new();
+    let gk = owner.handle();
     let driven = gk.clone();
 
     let (top_waits, elapsed) = runtime().block_on(driven.run_until(async move {
@@ -162,7 +163,7 @@ fn on_goalkeeper(n: usize) -> Report {
 
         let mut top_waits = Vec::new();
         for (level, task) in tasks {
-            let waits = task.await;
+            let waits = task.await.expect("the executor outlives the run");
             if level == 0 {
                 top_waits.extend(waits);
             }

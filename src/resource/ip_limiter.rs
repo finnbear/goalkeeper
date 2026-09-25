@@ -544,7 +544,7 @@ impl Addresses {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ArcGoalkeeper;
+    use crate::OwnedGoalkeeper;
 
     /// An address, for a case that needs one.
     fn ip(n: u16) -> IpAddr {
@@ -553,7 +553,7 @@ mod tests {
 
     #[test]
     fn an_address_may_connect_and_the_permit_frees_its_slot() {
-        let gk = ArcGoalkeeper::new();
+        let gk = OwnedGoalkeeper::new();
         let permit = gk
             .connection_permit(ip(1), "test")
             .expect("first connection");
@@ -587,7 +587,7 @@ mod tests {
 
     #[test]
     fn bandwidth_is_recorded_and_read_back_per_direction() {
-        let gk = ArcGoalkeeper::new();
+        let gk = OwnedGoalkeeper::new();
         let address = ip(2);
 
         // Sent as traffic rather than as one number, since a token bucket
@@ -619,14 +619,14 @@ mod tests {
 
     #[test]
     fn an_unknown_address_is_not_over_anything() {
-        let gk = ArcGoalkeeper::new();
+        let gk = OwnedGoalkeeper::new();
         assert!(!gk.address_over_bandwidth(ip(3), Direction::Tx));
         assert!(!gk.address_over_bandwidth(ip(3), Direction::Rx));
     }
 
     #[test]
     fn sessions_are_counted_while_held() {
-        let gk = ArcGoalkeeper::new();
+        let gk = OwnedGoalkeeper::new();
         let address = ip(4);
         let seen = |target: IpAddr| {
             let mut actives = 0;

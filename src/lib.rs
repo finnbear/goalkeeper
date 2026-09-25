@@ -47,7 +47,8 @@
 //! A process wants exactly one, since these budgets are the host's. That is
 //! [`SystemGoalkeeper`], a zero-sized handle to a `static`. Tests want an
 //! instance of their own, so one test's flood is not another's noise; that is
-//! [`ArcGoalkeeper`].
+//! an [`OwnedGoalkeeper`], which hands out [`ArcGoalkeeper`] handles and ends
+//! the instance's tasks when dropped.
 //!
 //! Both `Deref` to a [`Goalkeeper`], so the API is inherent methods there and
 //! `SystemGoalkeeper.set_memory_limit(..)` is the same call as
@@ -83,7 +84,7 @@ use std::time::{Duration, Instant};
 /// its binary, so their counts, ledgers and pressure bleed together and an
 /// assertion passes or fails by running order. The initializer panics under
 /// `cfg(test)` to forbid it: a test wanting an instance constructs its own with
-/// [`ArcGoalkeeper::new`]. Integration tests, examples and benches build the
+/// [`OwnedGoalkeeper::new`]. Integration tests, examples and benches build the
 /// crate without that cfg and get the real instance, since they exercise the
 /// process-wide thing on purpose.
 static SYSTEM: LazyLock<Goalkeeper> = LazyLock::new(system_init);
@@ -91,13 +92,17 @@ static SYSTEM: LazyLock<Goalkeeper> = LazyLock::new(system_init);
 #[cfg(test)]
 fn system_init() -> Goalkeeper {
     panic!(
-        "a unit test used the process-wide Goalkeeper; construct an ArcGoalkeeper::new() instead"
+        "a unit test used the process-wide Goalkeeper; construct an OwnedGoalkeeper::new() instead"
     )
 }
 
 #[cfg(not(test))]
 fn system_init() -> Goalkeeper {
-    Goalkeeper::default()
+    // A `static` is never dropped and nothing owns this one, so its executor
+    // can never close, and need not keep what closing would take.
+    Goalkeeper::with_executor(crate::executor::Executor::permanent(
+        crate::executor::Config::default(),
+    ))
 }
 
 /// Everything the crate rations, for one process or one test.
@@ -106,7 +111,6 @@ fn system_init() -> Goalkeeper {
 /// [`Deref`][std::ops::Deref], so `SystemGoalkeeper.foo()` lands here. Only the
 /// operations that mint a guard are on the trait, since those have to know
 /// which handle they were reached through.
-#[derive(Default)]
 pub struct Goalkeeper {
     /// The priority scheduler, which rations CPU.
     pub(crate) executor: crate::executor::Executor,
@@ -143,6 +147,31 @@ pub struct Goalkeeper {
     /// window reconfigures a window late, which is what already happens to a
     /// connection that is not polled for a window.
     pub(crate) bandwidth_epoch: AtomicU64,
+}
+
+/// An instance whose executor can close, which is every one but the process's.
+impl Default for Goalkeeper {
+    fn default() -> Self {
+        Self::with_executor(crate::executor::Executor::default())
+    }
+}
+
+impl Goalkeeper {
+    /// An instance around `executor`, with everything else as it starts.
+    ///
+    /// Named field by field rather than `..Default::default()`, which would
+    /// build a second executor only to drop it.
+    fn with_executor(executor: crate::executor::Executor) -> Self {
+        Self {
+            executor,
+            limiter: Default::default(),
+            #[cfg(feature = "tls")]
+            handshakes: Default::default(),
+            controller: Default::default(),
+            pressure: Default::default(),
+            bandwidth_epoch: Default::default(),
+        }
+    }
 }
 
 /// A handle to a [`Goalkeeper`], and the operations that need to know which one.
@@ -477,11 +506,14 @@ impl Goalkeeper {
     // ------------------------------------------------------------- schedule
 
     /// Spawns `future` at `priority`.
+    ///
+    /// Completes with [`None`] if the future was dropped unfinished because the
+    /// executor closed: an [`OwnedGoalkeeper`] was dropped.
     pub fn spawn<F>(
         &self,
         priority: crate::executor::priority::Priority,
         future: F,
-    ) -> async_task::Task<F::Output>
+    ) -> async_task::FallibleTask<F::Output>
     where
         F: std::future::Future + Send + 'static,
         F::Output: Send + 'static,
@@ -495,7 +527,7 @@ impl Goalkeeper {
         &self,
         priority: crate::executor::priority::SharedPriority,
         future: F,
-    ) -> async_task::Task<F::Output>
+    ) -> async_task::FallibleTask<F::Output>
     where
         F: std::future::Future + Send + 'static,
         F::Output: Send + 'static,
@@ -512,6 +544,28 @@ impl Goalkeeper {
         future: F,
     ) -> impl std::future::Future<Output = F::Output> {
         self.executor.run_until(self, future)
+    }
+
+    /// Waits until `deadline`, woken as soon as it passes even part way through
+    /// a turn of the schedule, which a tokio timer is not.
+    ///
+    /// See [`executor::timer`].
+    pub fn sleep_until(&self, deadline: std::time::Instant) -> crate::executor::timer::Sleep {
+        self.executor.sleep_until(deadline)
+    }
+
+    /// Ticks first at `start`, then every `period`, fired like
+    /// [`Self::sleep_until`]. A tick more than `late` late delays the rest
+    /// rather than being caught up with; see
+    /// [`Interval::late`](crate::executor::timer::Interval::late). `late` must
+    /// be at most `period`.
+    pub fn interval_at(
+        &self,
+        start: std::time::Instant,
+        period: std::time::Duration,
+        late: std::time::Duration,
+    ) -> crate::executor::timer::Interval {
+        self.executor.interval_at(start, period, late)
     }
 
     /// Live task counts, for whoever reports on the process.
@@ -835,19 +889,62 @@ impl std::ops::Deref for SystemGoalkeeper {
 impl ProvideGoalkeeper for SystemGoalkeeper {}
 
 /// An instance of its own, for tests and for callers with two independent
-/// workloads.
+/// workloads, and the owner of its tasks.
 ///
-/// Cloning shares one instance. Guards parameterised on this hold a clone, so
-/// an instance outlives every permit, session and connection it issued.
-#[derive(Clone, Debug, Default)]
-pub struct ArcGoalkeeper(Arc<Goalkeeper>);
+/// Not [`Clone`]: what is handed around is an [`ArcGoalkeeper`], from
+/// [`Self::handle`]. Dropping this closes the instance's executor, dropping
+/// every task spawned on it, finished or not, along with whatever they hold.
+///
+/// An owner rather than a last handle, since a task routinely holds a handle
+/// — through a permit, a connection, or a clone it captured — and waiting for
+/// the last handle would wait on the tasks, which wait on the executor.
+#[derive(Debug)]
+pub struct OwnedGoalkeeper(ArcGoalkeeper);
 
-impl ArcGoalkeeper {
+impl OwnedGoalkeeper {
     /// A [`Goalkeeper`] of its own, sharing nothing with any other.
     pub fn new() -> Self {
-        Self::default()
+        Self(ArcGoalkeeper(Arc::default()))
+    }
+
+    /// A handle to this instance, to hand to whatever needs one.
+    pub fn handle(&self) -> ArcGoalkeeper {
+        self.0.clone()
     }
 }
+
+impl Default for OwnedGoalkeeper {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// To a handle rather than to the [`Goalkeeper`], so the guard-minting methods
+/// on [`ProvideGoalkeeper`] are reachable from the owner as well.
+impl std::ops::Deref for OwnedGoalkeeper {
+    type Target = ArcGoalkeeper;
+
+    fn deref(&self) -> &ArcGoalkeeper {
+        &self.0
+    }
+}
+
+impl Drop for OwnedGoalkeeper {
+    fn drop(&mut self) {
+        self.0.executor.close();
+    }
+}
+
+/// A handle to an [`OwnedGoalkeeper`]'s instance.
+///
+/// Cloning shares one instance. Guards parameterised on this hold a clone, so
+/// the instance's ledgers outlive every permit, session and connection it
+/// issued. Its tasks do not outlive the owner: past that, a task spawned
+/// through a handle is dropped unrun.
+///
+/// Only an owner makes one, so every instance has one to close it.
+#[derive(Clone, Debug)]
+pub struct ArcGoalkeeper(Arc<Goalkeeper>);
 
 impl std::ops::Deref for ArcGoalkeeper {
     type Target = Goalkeeper;

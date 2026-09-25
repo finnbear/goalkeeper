@@ -6,7 +6,7 @@
 
 #![cfg(feature = "tls")]
 
-use goalkeeper::ArcGoalkeeper;
+use goalkeeper::OwnedGoalkeeper;
 use goalkeeper::http::ServeHttp;
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -64,7 +64,8 @@ fn negotiated(preset: bool) -> Option<Vec<u8>> {
     if preset {
         server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     }
-    let gk = ArcGoalkeeper::new();
+    let owner = OwnedGoalkeeper::new();
+    let gk = owner.handle();
     let driven = gk.clone();
 
     tokio::runtime::Builder::new_current_thread()

@@ -23,7 +23,7 @@
 
 use goalkeeper::conn::{Conn, ConnIo};
 use goalkeeper::resource::bandwidth::Direction;
-use goalkeeper::{ArcGoalkeeper, ProvideGoalkeeper, SystemGoalkeeper};
+use goalkeeper::{ArcGoalkeeper, OwnedGoalkeeper, ProvideGoalkeeper, SystemGoalkeeper};
 
 use goalkeeper::executor::priority::{Priority, UserPriority, UserPriority::*};
 use std::future::Future;
@@ -86,7 +86,8 @@ where
         .enable_all()
         .build()
         .unwrap();
-    let gk = ArcGoalkeeper::new();
+    let owner = OwnedGoalkeeper::new();
+    let gk = owner.handle();
     gk.set_schedule_window(Duration::from_millis(20));
     gk.set_aging_base(Duration::from_millis(5));
     let driven = gk.clone();
@@ -417,7 +418,7 @@ fn a_blocked_loop_becomes_cpu_pressure_on_its_own() {
 /// sibling failed and blamed the ledger. An instance removes that failure mode,
 /// and needs no [`serial`] since there is nothing here to share.
 fn an_unspent_lease_is_already_charged() {
-    let gk = ArcGoalkeeper::new();
+    let gk = OwnedGoalkeeper::new();
     gk.set_bandwidth_limits(1_000_000, 1_000_000);
 
     let peer = addr(23, 1);
@@ -484,7 +485,7 @@ fn admitted(
 fn a_flood_cannot_take_the_ram_a_player_has_not_claimed() {
     const CHUNK: u64 = 64 * 1024;
 
-    let gk = ArcGoalkeeper::new();
+    let gk = OwnedGoalkeeper::new();
     gk.set_memory_limit(16 * 1024 * 1024);
 
     // A flood of strangers reserves everything it can get.
@@ -548,7 +549,7 @@ fn established_players_do_not_leave_their_ram_with_the_strangers() {
     const CHUNK: u64 = 32 * 1024;
     const CLIENTS: u16 = 32;
 
-    let gk = ArcGoalkeeper::new();
+    let gk = OwnedGoalkeeper::new();
     gk.set_memory_limit(64 * 1024 * 1024);
 
     let mut conns = Vec::new();
