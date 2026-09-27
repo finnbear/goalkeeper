@@ -370,7 +370,8 @@ impl Goalkeeper {
         crate::resource::pressure(self)
     }
 
-    /// What goalkeeper measured for itself, smoothed. `ram` is always zero.
+    /// What goalkeeper measured for itself: CPU as accumulated evidence of
+    /// repeated lateness, the link smoothed. `ram` is always zero.
     pub fn internal_pressure(&self) -> Pressure {
         crate::resource::internal_pressure(self)
     }
@@ -493,14 +494,49 @@ impl Goalkeeper {
         crate::resource::set_config(self, |config| config.dwell = dwell);
     }
 
-    /// Weight given to the newest sample, in `0..=1`.
+    /// Weight given to the newest bandwidth sample, in `0..=1`.
     ///
-    /// The rest is carried over, so one bad window moves the number a little
-    /// and a bad second moves it a lot.
+    /// The rest is carried over, so one busy window moves the number a little
+    /// and a busy second moves it a lot. Scheduling lateness is not smoothed
+    /// but accumulated; see [`Self::set_lateness_step`].
     ///
     /// Default: `0.25`, roughly a one-second memory
     pub fn set_pressure_smoothing(&self, smoothing: f32) {
         crate::resource::set_config(self, |config| config.smoothing = smoothing);
+    }
+
+    /// Lateness under this fraction of a window is not evidence of CPU
+    /// pressure: it is the jitter of a scheduler that is keeping up.
+    ///
+    /// Default: `0.1`
+    pub fn set_lateness_floor(&self, floor: f32) {
+        crate::resource::set_config(self, |config| config.lateness_floor = floor);
+    }
+
+    /// CPU pressure one window adds that ran a whole window late.
+    ///
+    /// Scheduling lateness is read as evidence rather than averaged: a window
+    /// that ran late adds to CPU pressure, more the later it ran, and time back
+    /// on schedule drains it (see [`Self::set_lateness_drain`]). Less than a
+    /// window late adds proportionally less, down to nothing at the floor;
+    /// more adds more, but at most one and a half times this, however long the
+    /// stall. So strain takes lateness that repeats, and no single stall — a
+    /// long tick, a hypervisor pause — can cause it: with the default, four
+    /// windows at the very least, and five that ran a window late.
+    ///
+    /// Default: `0.2`
+    pub fn set_lateness_step(&self, step: f32) {
+        crate::resource::set_config(self, |config| config.lateness_step = step);
+    }
+
+    /// CPU pressure drained per second the schedule runs on time.
+    ///
+    /// Only on time: a loop wedged in long turns spends no time on schedule, so
+    /// it drains nothing between its stalls and registers.
+    ///
+    /// Default: `0.125`, from full to nothing in eight seconds
+    pub fn set_lateness_drain(&self, per_second: f32) {
+        crate::resource::set_config(self, |config| config.lateness_drain = per_second);
     }
 
     // ------------------------------------------------------------- schedule

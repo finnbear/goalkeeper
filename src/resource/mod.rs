@@ -9,6 +9,16 @@
 //! Scheduling lag rather than whole-machine utilisation, since a game loop that
 //! is effectively single-threaded can be entirely saturated on a four-core box
 //! that `/proc` calls 25% busy.
+//!
+//! Lag is read as *evidence*, not averaged: each window that runs significantly
+//! late adds to it, more the later it ran, and time spent back on schedule
+//! drains it. So pressure comes from lateness that repeats, never from one
+//! stall however long — a stall is one missed wake-up of the probe, and the
+//! same stall is what an application's own long tick, a hypervisor pause or a
+//! garbage-collecting neighbour looks like. Averaging it instead let a single
+//! stall of about a third of a second strain the whole process, and everything
+//! that tightens on strain (admission first) tightened against callers who had
+//! nothing to do with it.
 
 pub mod bandwidth;
 /// Only TLS and QUIC have crypto to ration, so without them there is no pool
@@ -28,6 +38,10 @@ use std::time::{Duration, Instant};
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
 pub struct Pressure {
     /// How far behind the schedule is running. Measured internally.
+    ///
+    /// Internally, accumulated evidence of repeated lateness, from `0.0` (none)
+    /// to `1.0` (as much as is kept); see the module docs. A user-supplied value
+    /// is whatever the application says.
     pub cpu: f32,
     /// How much of the bandwidth budget is spent. Measured internally.
     pub network: f32,
@@ -96,8 +110,8 @@ impl Thresholds {
 ///
 /// The thresholds are per axis because the axes are not alike: a link a tenth
 /// over its budget is routine, where a CPU a tenth over its schedule is a tick
-/// already missed. Each carries its own band; the dwell and the smoothing are
-/// one policy over all three.
+/// already missed. Each carries its own band; the dwell is one policy over all
+/// three. The link is smoothed, and lateness accumulated, each by its own rule.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub(crate) struct Config {
     /// Scheduling lateness.
@@ -111,11 +125,30 @@ pub(crate) struct Config {
     /// Guards the same oscillation from the other side, and hides a single
     /// unlucky window.
     pub dwell: Duration,
-    /// Weight given to the newest sample, in `0..=1`.
+    /// Weight given to the newest bandwidth sample, in `0..=1`.
     ///
-    /// The rest is carried over, so a lone bad window moves the number a little
-    /// and a bad second moves it a lot.
+    /// The rest is carried over, so a lone busy window moves the number a
+    /// little and a busy second moves it a lot. Lateness is not smoothed; see
+    /// [`Self::lateness_step`].
     pub smoothing: f32,
+    /// Lateness under this fraction of a window is not evidence of anything:
+    /// it is the ordinary jitter of a scheduler that is keeping up.
+    pub lateness_floor: f32,
+    /// Evidence one window adds that ran a whole window late, as a share of the
+    /// most that is kept (`1.0`).
+    ///
+    /// Less late adds proportionally less, down to nothing at
+    /// [`Self::lateness_floor`]; later adds more, but never more than
+    /// [`LONG_STALL_CAP`] times this. The cap is the guarantee: with the default
+    /// `0.2`, no fewer than four late windows, and five ordinary ones, reach the
+    /// default threshold, however late any one of them ran.
+    pub lateness_step: f32,
+    /// Evidence drained per second the schedule runs on time.
+    ///
+    /// Only on time: the part of a window spent late is not recovery, or a loop
+    /// wedged in long turns — which wakes the probe once per turn, late every
+    /// time — would drain between its own stalls and never register.
+    pub lateness_drain: f32,
 }
 
 impl Default for Config {
@@ -144,7 +177,40 @@ impl Default for Config {
             dwell: Duration::from_secs(1),
             // At one sample per 100ms window, roughly a one-second memory.
             smoothing: 0.25,
+            // 10ms of a 100ms window.
+            lateness_floor: 0.1,
+            lateness_step: 0.2,
+            // A full reading drains in eight seconds of keeping up, and falls
+            // back under the default `leave` in one. Stalls further apart than
+            // about 1.6 seconds (2.4 for the longest) never accumulate.
+            lateness_drain: 0.125,
         }
+    }
+}
+
+/// How many [`Config::lateness_step`]s one window's lateness may add at most.
+///
+/// Above one: a stall of seconds is worse than one that just missed a window,
+/// and a loop wedged in long turns should register sooner than one merely
+/// behind. But bounded, since the probe cannot tell a long stall caused by load
+/// from one caused by anything else, and no single stall may strain the process.
+const LONG_STALL_CAP: f32 = 1.5;
+
+/// How significant a window's lateness is, in [`Config::lateness_step`]s.
+///
+/// `late` is in windows. Nothing under `floor`; rising linearly to one at a
+/// whole window late; then logarithmically, `1 + ½·log₂(late)`, which is 1.5 at
+/// two windows, up to [`LONG_STALL_CAP`].
+fn lateness_severity(late: f32, floor: f32) -> f32 {
+    // Kept under one, so the linear part has a span to rise over.
+    let floor = floor.clamp(0.0, 0.99);
+    // Written to be false for NaN, which is no evidence either.
+    if !(late >= floor) {
+        0.0
+    } else if late <= 1.0 {
+        (late - floor) / (1.0 - floor)
+    } else {
+        (1.0 + 0.5 * late.log2()).min(LONG_STALL_CAP)
     }
 }
 
@@ -156,7 +222,8 @@ const NETWORK_TTL: Duration = Duration::from_secs(1);
 /// Owned by [`crate::Goalkeeper`], which is where the lock lives.
 pub(crate) struct State {
     config: Config,
-    /// Smoothed internal samples. `ram` is always zero here.
+    /// What goalkeeper measured: `cpu` accumulated from lateness, `network`
+    /// smoothed, `ram` the controller's last reading.
     internal: Pressure,
     user: Pressure,
     /// When the ledger last reported. It rolls lazily, off traffic, so without
@@ -266,6 +333,22 @@ impl State {
         *slot = *slot * (1.0 - alpha) + sample * alpha;
     }
 
+    /// The CPU evidence after one probe wake-up that came `late` into a
+    /// schedule of `window`s: what the lateness adds, less what the rest of the
+    /// window, spent on time, drains. See [`Config::lateness_step`] and
+    /// [`Config::lateness_drain`].
+    fn accumulate_lateness(&self, late: Duration, window: Duration) -> f32 {
+        let config = &self.config;
+        let late_windows = if window.is_zero() {
+            0.0
+        } else {
+            late.as_secs_f32() / window.as_secs_f32()
+        };
+        let rise = config.lateness_step * lateness_severity(late_windows, config.lateness_floor);
+        let drain = config.lateness_drain * window.saturating_sub(late).as_secs_f32();
+        (self.internal.cpu + rise - drain).clamp(0.0, 1.0)
+    }
+
     /// Re-decides each axis against its own band.
     fn settle(&mut self, now: Instant) {
         let combined = self.combined(now);
@@ -341,21 +424,16 @@ pub(crate) fn compute_strained_of(gk: &Goalkeeper) -> bool {
     })
 }
 
-/// Reports how late the schedule is running, as a fraction of one window.
+/// Reports how late the schedule is running: the probe woke `late` after it
+/// was due, on a schedule of one wake-up per `window`.
 ///
-/// Called once per window by the executor's probe. Zero means the probe woke on
-/// time, one that it woke a whole window late.
+/// Called once per window by the executor's probe. A stall of any length is
+/// one call, since the probe skips the windows it missed rather than catching
+/// up, and so one step of evidence at most; see [`Config::lateness_step`].
 pub(crate) fn record_cpu_sample_of(gk: &Goalkeeper, late: Duration, window: Duration) {
     let now = Instant::now();
-    let sample = if window.is_zero() {
-        0.0
-    } else {
-        late.as_secs_f32() / window.as_secs_f32()
-    };
     with_of(gk, |state| {
-        let mut cpu = state.internal.cpu;
-        state.smooth(&mut cpu, sample);
-        state.internal.cpu = cpu;
+        state.internal.cpu = state.accumulate_lateness(late, window);
         state.settle(now);
     });
 }
@@ -408,8 +486,9 @@ pub(crate) fn set_glide_step(gk: &Goalkeeper, step: f32) {
 /// Called once per controller tick, closing the loop on memory the way
 /// [`record_network_sample`] closes it on the link.
 ///
-/// Not smoothed. The other two axes are noisy samples of a rate; this is a
-/// direct reading of a stock, and averaging it would only delay the response.
+/// Not smoothed. The link is a noisy sample of a rate, and lateness is
+/// accumulated as evidence; this is a direct reading of a stock, and averaging
+/// it would only delay the response.
 pub(crate) fn record_memory_of(gk: &Goalkeeper, fullness: f32) {
     let now = Instant::now();
     with_of(gk, |state| {
@@ -589,24 +668,134 @@ mod tests {
         assert!(gk.strained(), "flipped back within the dwell");
     }
 
-    #[test]
-    fn one_bad_window_is_not_an_emergency() {
-        let gk = goalkeeper();
-        let window = Duration::from_millis(100);
+    const WINDOW: Duration = Duration::from_millis(100);
 
-        // A whole window late, once. A single hypervisor hiccup must not read
-        // as sustained overload.
-        record_cpu_sample_of(&gk, window, window);
-        assert!(
-            gk.internal_pressure().cpu < Config::default().cpu.enter,
-            "a lone stall crossed the threshold on its own"
-        );
+    fn cpu(gk: &OwnedGoalkeeper) -> f32 {
+        gk.internal_pressure().cpu
+    }
 
-        // Sustained, it gets there.
-        for _ in 0..20 {
-            record_cpu_sample_of(&gk, window, window);
+    fn enter() -> f32 {
+        Config::default().cpu.enter
+    }
+
+    /// A window that ran `late`, on the default schedule.
+    fn late(gk: &OwnedGoalkeeper, late: Duration) {
+        record_cpu_sample_of(gk, late, WINDOW);
+    }
+
+    /// `n` windows on time.
+    fn on_time(gk: &OwnedGoalkeeper, n: usize) {
+        for _ in 0..n {
+            record_cpu_sample_of(gk, Duration::ZERO, WINDOW);
         }
-        assert!(gk.internal_pressure().cpu >= Config::default().cpu.enter);
+    }
+
+    #[test]
+    fn severity_rises_with_lateness_and_is_capped() {
+        let floor = Config::default().lateness_floor;
+        assert_eq!(lateness_severity(0.0, floor), 0.0);
+        assert_eq!(lateness_severity(0.09, floor), 0.0, "jitter counted");
+        assert!(lateness_severity(0.3, floor) > lateness_severity(0.2, floor));
+        assert!((lateness_severity(1.0, floor) - 1.0).abs() < 1e-6);
+        assert!((lateness_severity(2.0, floor) - 1.5).abs() < 1e-6);
+        assert_eq!(lateness_severity(1000.0, floor), LONG_STALL_CAP);
+        assert_eq!(lateness_severity(f32::NAN, floor), 0.0);
+    }
+
+    /// The point of the whole model. A process stalled for ten seconds, once,
+    /// must not strain: the stall is one missed wake-up, and whatever caused
+    /// it, a caller arriving afterwards did not.
+    #[test]
+    fn a_lone_stall_of_any_length_is_not_an_emergency() {
+        let gk = goalkeeper();
+        late(&gk, Duration::from_secs(10));
+        assert!(
+            cpu(&gk) < enter(),
+            "a lone stall crossed the threshold on its own: {}",
+            cpu(&gk)
+        );
+        assert!(!gk.strained());
+    }
+
+    /// Stalls apart by more than the drain can absorb never add up, however
+    /// many of them there are.
+    #[test]
+    fn spaced_out_stalls_do_not_accumulate() {
+        let gk = goalkeeper();
+        // A whole-window stall adds 0.2; twenty windows on time, two seconds,
+        // drain 0.25.
+        for _ in 0..100 {
+            late(&gk, WINDOW);
+            on_time(&gk, 20);
+            assert!(cpu(&gk) < enter(), "{}", cpu(&gk));
+        }
+    }
+
+    /// Back to back, they strain, at exactly the count the step promises: four
+    /// whole-window stalls are 0.8, the fifth is 1.0.
+    #[test]
+    fn repeated_stalls_strain_at_the_promised_count() {
+        let gk = goalkeeper();
+        for _ in 0..4 {
+            late(&gk, WINDOW);
+        }
+        assert!(cpu(&gk) < enter(), "four stalls were enough: {}", cpu(&gk));
+        late(&gk, WINDOW);
+        assert!(cpu(&gk) >= enter(), "five stalls were not: {}", cpu(&gk));
+    }
+
+    /// A loop wedged in long turns wakes the probe once per turn, late every
+    /// time, with no time on schedule in between to drain. It registers, and
+    /// sooner than stalls that only just missed a window, but never on one.
+    #[test]
+    fn a_loop_wedged_in_long_turns_registers() {
+        let gk = goalkeeper();
+        for _ in 0..3 {
+            late(&gk, Duration::from_secs(2));
+        }
+        assert!(cpu(&gk) < enter(), "three long stalls were enough");
+        late(&gk, Duration::from_secs(2));
+        assert!(cpu(&gk) >= enter(), "four long stalls were not");
+    }
+
+    /// Lateness that recurs every window registers even when no window is a
+    /// whole one late, faster the later they run; jitter under the floor never
+    /// does.
+    #[test]
+    fn persistent_lateness_registers_in_proportion() {
+        let windows_to_strain = |late_by: Duration| {
+            let gk = goalkeeper();
+            (1..=10_000).find(|_| {
+                late(&gk, late_by);
+                cpu(&gk) >= enter()
+            })
+        };
+        let thirty = windows_to_strain(Duration::from_millis(30)).expect("30ms never strained");
+        let sixty = windows_to_strain(Duration::from_millis(60)).expect("60ms never strained");
+        assert!(sixty < thirty, "later was not faster: {sixty} vs {thirty}");
+        assert!(thirty > 5, "30ms strained as fast as a stall: {thirty}");
+        assert_eq!(
+            windows_to_strain(Duration::from_millis(9)),
+            None,
+            "jitter under the floor strained"
+        );
+    }
+
+    /// Only time on schedule drains, at the configured rate: none while every
+    /// window is late, and from full to under `leave` in one second.
+    #[test]
+    fn evidence_drains_only_on_time() {
+        let gk = goalkeeper();
+        with_of(&gk, |state| state.internal.cpu = 1.0);
+        for _ in 0..50 {
+            late(&gk, WINDOW);
+        }
+        assert_eq!(cpu(&gk), 1.0, "drained while the schedule was late");
+
+        on_time(&gk, 11);
+        assert!(cpu(&gk) < Config::default().cpu.leave, "{}", cpu(&gk));
+        on_time(&gk, 80);
+        assert_eq!(cpu(&gk), 0.0, "did not drain in eight seconds");
     }
 
     #[test]

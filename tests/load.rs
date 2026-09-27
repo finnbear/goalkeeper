@@ -378,8 +378,8 @@ fn a_blocked_loop_becomes_cpu_pressure_on_its_own() {
     let _serial = serial();
 
     // Read from the instance being driven, which is the one the probe reports
-    // to. Rises rather than crosses a threshold, because smoothing moves it by
-    // a fraction of the lateness rather than to it.
+    // to. Rises rather than crosses a threshold: one stall is one step of
+    // evidence, never enough to strain on its own.
     let (before, after) = drive(|gk| async move {
         let before = gk.internal_pressure().cpu;
         gk.spawn(Priority::User(L0), async {
@@ -396,9 +396,18 @@ fn a_blocked_loop_becomes_cpu_pressure_on_its_own() {
         (before, gk.internal_pressure().cpu)
     });
 
+    // The probe was due within a window of the block starting, so it woke at
+    // least two windows late: the capped step, 0.3 by default, less the drain
+    // of the fifty milliseconds after.
     assert!(
-        after > before + 0.5,
+        after > before + 0.25,
         "300ms of a blocked loop went unnoticed: {before:.2} -> {after:.2}"
+    );
+    // And no more than that: a single stall, however long, stays short of the
+    // default threshold of 0.925.
+    assert!(
+        after - before < 0.925,
+        "one stall strained on its own: {before:.2} -> {after:.2}"
     );
 }
 
