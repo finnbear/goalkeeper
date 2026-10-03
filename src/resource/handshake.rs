@@ -14,6 +14,8 @@
 
 use crate::{Goalkeeper, ProvideGoalkeeper, SystemGoalkeeper};
 
+use fxhash::FxHashMap;
+use log::warn;
 use std::future::Future;
 use std::net::IpAddr;
 use std::sync::Mutex;
@@ -150,12 +152,17 @@ pub(crate) fn slot<P: ProvideGoalkeeper>(
             crate::resource::compute_glide_of(gk),
         )
     };
-    let mut slot = gk
-        .handshakes
-        .registry
-        .lock()
-        .unwrap()
-        .admit(ip, accepted, policy)?;
+    let (slot, batch) = {
+        let mut registry = gk.handshakes.registry.lock().unwrap();
+        let slot = registry.admit(ip, accepted, policy);
+        (slot, registry.take_due_batch(accepted))
+    };
+    // Outside the lock: formatting a full batch is the slowest thing here, and
+    // every handshake waits on that lock.
+    if let Some(batch) = batch {
+        batch.log();
+    }
+    let mut slot = slot?;
     slot.provider = Some(provider.clone());
     Some(slot)
 }
@@ -163,6 +170,111 @@ pub(crate) fn slot<P: ProvideGoalkeeper>(
 /// See [`crate::ProvideGoalkeeper::handshake_counts`].
 pub(crate) fn counts(gk: &Goalkeeper) -> Counts {
     gk.handshakes.registry.lock().unwrap().take_counts()
+}
+
+/// Distinct addresses a [`Batch`] names, per kind, before it only counts. A
+/// real flood comes from far more, and naming them all would make the record of
+/// an attack a resource it can exhaust; the first few are what tell a handful
+/// holding the pool from a crowd anyway.
+const MAX_ADDRESSES: usize = 32;
+
+/// The shortest span a [`Batch`] covers before it is logged.
+const BATCH_SPAN: Duration = Duration::from_secs(10);
+
+/// The fewest kills and refusals a [`Batch`] holds before it is logged, so a
+/// quiet host says nothing about a straggler or two.
+const BATCH_EVENTS: u32 = 10;
+
+/// Who [`Counts::killed`] and [`Counts::refused`] happened to, gathered to be
+/// logged together: for telling a crowd of ordinary clients apart from a few
+/// addresses holding the pool, which the counts alone can't.
+///
+/// Logged rather than reported, the way a refused connection is (see
+/// `IpLimiter::warn`), and batched for the same reason that is rate limited:
+/// under a flood, a line per event would be the louder denial of service.
+#[derive(Debug, Default, PartialEq)]
+struct Batch {
+    /// When the first event in it happened.
+    started: Option<Instant>,
+    /// Kills and refusals, named or not.
+    events: u32,
+    /// Handshakes given up on, by address.
+    killed: FxHashMap<IpAddr, u32>,
+    /// Handshakes turned away, by address.
+    refused: FxHashMap<IpAddr, u32>,
+    /// Kills of addresses past [`MAX_ADDRESSES`], counted but not named.
+    killed_unnamed: u32,
+    /// Refusals of addresses past [`MAX_ADDRESSES`], counted but not named.
+    refused_unnamed: u32,
+}
+
+impl Batch {
+    /// Counts one against `ip` in `map`, or in `unnamed` once the map is full
+    /// of other addresses.
+    fn note(map: &mut FxHashMap<IpAddr, u32>, unnamed: &mut u32, ip: IpAddr) {
+        if let Some(count) = map.get_mut(&ip) {
+            *count = count.saturating_add(1);
+        } else if map.len() < MAX_ADDRESSES {
+            map.insert(ip, 1);
+        } else {
+            *unnamed = unnamed.saturating_add(1);
+        }
+    }
+
+    fn event(&mut self, now: Instant) {
+        self.started.get_or_insert(now);
+        self.events = self.events.saturating_add(1);
+    }
+
+    fn killed(&mut self, ip: IpAddr, now: Instant) {
+        self.event(now);
+        Self::note(&mut self.killed, &mut self.killed_unnamed, ip);
+    }
+
+    fn refused(&mut self, ip: IpAddr, now: Instant) {
+        self.event(now);
+        Self::note(&mut self.refused, &mut self.refused_unnamed, ip);
+    }
+
+    /// Whether it has gathered enough, over long enough, to be logged.
+    fn due(&self, now: Instant) -> bool {
+        self.events >= BATCH_EVENTS
+            && self
+                .started
+                .is_some_and(|started| now.saturating_duration_since(started) >= BATCH_SPAN)
+    }
+
+    /// A line per kind that happened: each address and its count, most first.
+    fn log(&self) {
+        let seconds = self
+            .started
+            .map_or(0, |started| started.elapsed().as_secs());
+        Self::log_kind("expired", &self.killed, self.killed_unnamed, seconds);
+        Self::log_kind("refused", &self.refused, self.refused_unnamed, seconds);
+    }
+
+    fn log_kind(what: &str, counts: &FxHashMap<IpAddr, u32>, unnamed: u32, seconds: u64) {
+        if counts.is_empty() && unnamed == 0 {
+            return;
+        }
+        let mut sorted: Vec<_> = counts.iter().collect();
+        sorted.sort_unstable_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+        let total = sorted.iter().map(|(_, n)| **n as u64).sum::<u64>() + unnamed as u64;
+        let map = sorted
+            .iter()
+            .map(|(ip, n)| format!("{ip}: {n}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let rest = if unnamed > 0 {
+            format!(" and {unnamed} from addresses past the cap")
+        } else {
+            String::new()
+        };
+        warn!(
+            "handshakes {what} in {seconds}s: {total} from {} addresses {{{map}}}{rest}",
+            sorted.len()
+        );
+    }
 }
 
 /// What has happened to handshakes over a window.
@@ -206,6 +318,8 @@ pub(crate) struct Registry {
     entries: Vec<Entry>,
     next_id: u64,
     counts: Counts,
+    /// Who the kills and refusals happened to, until there are enough to log.
+    batch: Batch,
 }
 
 impl Registry {
@@ -232,7 +346,14 @@ impl Registry {
 
         // 1. The expired, whoever owns them.
         let before = self.entries.len();
-        self.entries.retain(|entry| age(entry) < policy.deadline);
+        let batch = &mut self.batch;
+        self.entries.retain(|entry| {
+            let alive = age(entry) < policy.deadline;
+            if !alive {
+                batch.killed(entry.ip, accepted);
+            }
+            alive
+        });
         self.counts.killed = self
             .counts
             .killed
@@ -259,6 +380,7 @@ impl Registry {
             };
             self.entries.swap_remove(newest);
             self.counts.killed = self.counts.killed.saturating_add(1);
+            self.batch.killed(ip, accepted);
         }
 
         // 3, 4 and 5.
@@ -272,10 +394,12 @@ impl Registry {
                 .map(|(index, _)| index)
             else {
                 self.counts.refused = self.counts.refused.saturating_add(1);
+                self.batch.refused(ip, accepted);
                 return None;
             };
-            self.entries.swap_remove(oldest);
+            let evicted = self.entries.swap_remove(oldest);
             self.counts.killed = self.counts.killed.saturating_add(1);
+            self.batch.killed(evicted.ip, accepted);
         }
 
         let id = self.next_id;
@@ -312,6 +436,11 @@ impl Registry {
 
     fn take_counts(&mut self) -> Counts {
         std::mem::take(&mut self.counts)
+    }
+
+    /// The batch, and a fresh one in its place, if it is due to be logged.
+    fn take_due_batch(&mut self, now: Instant) -> Option<Batch> {
+        self.batch.due(now).then(|| std::mem::take(&mut self.batch))
     }
 }
 
@@ -551,6 +680,65 @@ mod tests {
             0,
             "the window starts empty"
         );
+    }
+
+    #[test]
+    fn names_who_was_killed_and_refused() {
+        let mut registry = Registry::default();
+        let start = Instant::now();
+        let _slots: Vec<_> = (0..4)
+            .map(|n| registry.admit_one(ip(n), start).unwrap())
+            .collect();
+        // Full of fast handshakes: refused, twice.
+        assert!(registry.admit_one(ip(9), start).is_none());
+        assert!(registry.admit_one(ip(9), start).is_none());
+        // Past the deadline: all four reaped for the arrival.
+        assert!(registry.admit_one(ip(8), at(start, 6)).is_some());
+
+        let batch = &registry.batch;
+        assert_eq!(batch.refused.get(&ip(9)), Some(&2));
+        assert_eq!(batch.refused.len(), 1);
+        for n in 0..4 {
+            assert_eq!(batch.killed.get(&ip(n)), Some(&1));
+        }
+        assert_eq!(batch.killed.len(), 4);
+        assert_eq!(batch.events, 6);
+        assert_eq!(batch.started, Some(start));
+    }
+
+    #[test]
+    fn logs_only_enough_over_long_enough() {
+        let start = Instant::now();
+        let mut registry = Registry::default();
+        for _ in 0..BATCH_EVENTS - 1 {
+            registry.batch.refused(ip(1), start);
+        }
+        let late = start + BATCH_SPAN;
+        assert!(registry.take_due_batch(late).is_none(), "too few");
+
+        registry.batch.refused(ip(1), start);
+        assert!(
+            registry
+                .take_due_batch(late - Duration::from_millis(1))
+                .is_none(),
+            "too soon"
+        );
+
+        let batch = registry.take_due_batch(late).unwrap();
+        assert_eq!(batch.refused.get(&ip(1)), Some(&BATCH_EVENTS));
+        assert_eq!(registry.batch, Batch::default(), "the next starts empty");
+    }
+
+    #[test]
+    fn stops_naming_past_the_cap() {
+        let start = Instant::now();
+        let mut batch = Batch::default();
+        for n in 0..=MAX_ADDRESSES as u32 {
+            batch.refused(IpAddr::from(n.to_be_bytes()), start);
+        }
+        assert_eq!(batch.refused.len(), MAX_ADDRESSES);
+        assert_eq!(batch.refused_unnamed, 1);
+        assert_eq!(batch.events, MAX_ADDRESSES as u32 + 1);
     }
 
     #[tokio::test]
