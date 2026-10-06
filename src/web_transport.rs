@@ -111,6 +111,7 @@ pub trait ServeWebTransport: ProvideGoalkeeper {
             handler,
             max_open: DEFAULT_MAX_OPEN,
             reload_every: Duration::from_secs(60),
+            batch_sends: false,
             transport: None,
             server: None,
         }
@@ -129,6 +130,7 @@ pub struct WebTransportServerBuilder<H, P: ProvideGoalkeeper = SystemGoalkeeper>
     handler: H,
     max_open: usize,
     reload_every: Duration,
+    batch_sends: bool,
     transport: Option<ConfigureTransport>,
     server: Option<ConfigureServer>,
 }
@@ -141,6 +143,23 @@ where
     /// Connections beyond which new ones are refused before any crypto.
     pub fn max_open_connections(mut self, max: usize) -> Self {
         self.max_open = max;
+        self
+    }
+
+    /// Sends the packets the executor's tasks produce in a turn with one system
+    /// call, `sendmmsg`, at the end of the turn, rather than one per packet as
+    /// each is produced.
+    ///
+    /// For a server whose connections each send a little at once, such as a
+    /// game's tick, this is most of the cost of sending: every connection's
+    /// packet otherwise costs a system call of its own, and on a virtual
+    /// machine an exit to the hypervisor besides. Segmentation offload cannot
+    /// help with that, since it only combines packets to one destination.
+    ///
+    /// A packet waits at most for the rest of its turn, and is sent before the
+    /// executor sleeps. Linux only; elsewhere this does nothing. A prototype.
+    pub fn batch_sends(mut self) -> Self {
+        self.batch_sends = true;
         self
     }
 
@@ -200,7 +219,7 @@ where
         // The endpoint driver quinn spawns from here sees no ambient route, so
         // it lands at `Main`: it belongs to no connection and every connection
         // needs it.
-        let runtime = Runtime::new(self.provider.clone());
+        let runtime = Runtime::new(self.provider.clone(), self.batch_sends);
         let (tx, rx) = runtime.meters();
         let Self {
             provider,
@@ -895,6 +914,9 @@ struct Runtime<P: ProvideGoalkeeper> {
     /// counters created there would be written forever and read by nobody.
     tx: Arc<AtomicU64>,
     rx: Arc<AtomicU64>,
+    /// Whether packets are sent in batches; see
+    /// [`WebTransportServerBuilder::batch_sends`].
+    batch_sends: bool,
 }
 
 /// Hand-written because `derive` would demand `P: Debug`, which a provider has
@@ -906,12 +928,13 @@ impl<P: ProvideGoalkeeper> std::fmt::Debug for Runtime<P> {
 }
 
 impl<P: ProvideGoalkeeper> Runtime<P> {
-    fn new(provider: P) -> Self {
+    fn new(provider: P, batch_sends: bool) -> Self {
         Self {
             provider,
             inner: quinn::TokioRuntime,
             tx: Arc::new(AtomicU64::new(0)),
             rx: Arc::new(AtomicU64::new(0)),
+            batch_sends,
         }
     }
 
@@ -941,8 +964,25 @@ impl<P: ProvideGoalkeeper> quinn::Runtime for Runtime<P> {
         &self,
         socket: std::net::UdpSocket,
     ) -> io::Result<Arc<dyn quinn::AsyncUdpSocket>> {
+        #[cfg(target_os = "linux")]
+        let inner: Arc<dyn quinn::AsyncUdpSocket> = if self.batch_sends {
+            // Its turns are the ones quinn's drivers run in. A wait on a full
+            // socket serves every connection, as the endpoint driver does, so
+            // it runs where that does.
+            let provider = self.provider.clone();
+            crate::batched_udp::Batched::wrap(
+                socket,
+                &self.inner,
+                &self.provider.executor,
+                Box::new(move |future| provider.spawn(Priority::Main, future).detach()),
+            )?
+        } else {
+            self.inner.wrap_udp_socket(socket)?
+        };
+        #[cfg(not(target_os = "linux"))]
+        let inner = self.inner.wrap_udp_socket(socket)?;
         Ok(Arc::new(Metered {
-            inner: self.inner.wrap_udp_socket(socket)?,
+            inner,
             tx: Arc::clone(&self.tx),
             rx: Arc::clone(&self.rx),
         }))

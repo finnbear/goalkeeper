@@ -32,7 +32,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::future::{Future, poll_fn};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
@@ -366,8 +366,25 @@ struct Shared {
     /// timer registered meanwhile before it sleeps. A timer registered outside
     /// one, as the earliest, wakes the executor to re-arm instead.
     turning: AtomicBool,
+    /// Whatever wants to run at the end of every turn; see
+    /// [`Executor::on_turn_end`].
+    turn_hooks: Mutex<Vec<Weak<dyn TurnHook>>>,
+    /// Whether `turn_hooks` holds anything, so a turn with none costs a load
+    /// rather than a lock.
+    has_turn_hooks: AtomicBool,
     /// Whether this executor can ever close, and what closing it takes.
     mode: Mode,
+}
+
+/// Something run at the end of every turn of [`Executor::run_until`]; see
+/// [`Executor::on_turn_end`].
+pub(crate) trait TurnHook: Send + Sync {
+    /// The turn's tasks have run, and the reactor is about to have its turn.
+    ///
+    /// Run on the executor's thread, with a lock held that other turns ending
+    /// on other threads also take, so it should be quick, and must not
+    /// register a hook itself.
+    fn turn_ended(&self);
 }
 
 /// Whether an executor can close. Fixed at construction.
@@ -450,8 +467,24 @@ impl Executor {
             timers: Mutex::new(Timers::default()),
             next_timer_nanos: AtomicU64::new(u64::MAX),
             turning: AtomicBool::new(false),
+            turn_hooks: Mutex::new(Vec::new()),
+            has_turn_hooks: AtomicBool::new(false),
             mode,
         }))
+    }
+
+    /// Runs `hook` at the end of every turn of [`Self::run_until`], until it is
+    /// dropped.
+    ///
+    /// For work that is cheaper done once for everything a turn's tasks
+    /// produced than once for each: sending the turn's packets with one system
+    /// call, for one. The end of a turn is when every task that was ready has
+    /// run, or as many as a turn runs, and the reactor, which would carry
+    /// anything out, has not yet had its turn.
+    #[allow(unused)]
+    pub(crate) fn on_turn_end(&self, hook: Weak<dyn TurnHook>) {
+        self.0.turn_hooks.lock().unwrap().push(hook);
+        self.0.has_turn_hooks.store(true, Ordering::Release);
     }
 
     /// Drops every task now, and every task spawned or woken from now on,
@@ -644,6 +677,7 @@ impl Executor {
                     future.as_mut().poll(cx)
                 };
                 if let Poll::Ready(output) = polled {
+                    shared.run_turn_hooks();
                     shared.turning.store(false, Ordering::SeqCst);
                     return Poll::Ready(output);
                 }
@@ -736,6 +770,8 @@ impl Executor {
                 // its wake brings, which comes soon.
                 break;
             }
+
+            shared.run_turn_hooks();
 
             // Whatever this turn registered, armed for now: this turn is the
             // last chance to before sleeping. Cleared first, so a timer
@@ -1017,6 +1053,24 @@ impl Shared {
             self.wake_executor();
         }
         Some(key)
+    }
+
+    /// Runs every live [`TurnHook`], forgetting the dropped ones.
+    fn run_turn_hooks(&self) {
+        if !self.has_turn_hooks.load(Ordering::Acquire) {
+            return;
+        }
+        let mut hooks = self.turn_hooks.lock().unwrap();
+        hooks.retain(|hook| match hook.upgrade() {
+            Some(hook) => {
+                hook.turn_ended();
+                true
+            }
+            None => false,
+        });
+        if hooks.is_empty() {
+            self.has_turn_hooks.store(false, Ordering::Release);
+        }
     }
 
     /// Brings `run_until` round for another turn, if it is waiting for one.

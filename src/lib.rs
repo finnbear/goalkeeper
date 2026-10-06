@@ -1,8 +1,9 @@
 // `deny` rather than `forbid`, so a named exception is possible at all.
 //
-// There is exactly one, in `tokio_net`: two `setsockopt` calls for socket
-// options neither `std` nor `socket2` wraps. Anything new belongs here, where
-// it is visible.
+// There are two. One in `tokio_net`: two `setsockopt` calls for socket options
+// neither `std` nor `socket2` wraps. One in `batched_udp`: `sendmmsg` and the
+// control messages that go with it, which neither wraps either. Anything new
+// belongs here, where it is visible.
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
@@ -58,6 +59,8 @@
 //! instance issued it, so a guard cannot give its claim back to the wrong one.
 //! The parameter defaults to [`SystemGoalkeeper`], which is zero-sized.
 
+#[cfg(all(feature = "web_transport", target_os = "linux"))]
+pub(crate) mod batched_udp;
 pub mod conn;
 pub mod executor;
 #[cfg(feature = "http")]
