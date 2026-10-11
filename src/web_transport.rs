@@ -22,7 +22,6 @@ use crate::conn::{Conn, Throttled, canonize};
 use crate::executor::priority::{Priority, SharedPriority};
 use crate::http::tls::TlsConfig;
 use crate::resource::bandwidth::{self, Direction};
-use crate::resource::handshake;
 use crate::{Goalkeeper, ProvideGoalkeeper, SystemGoalkeeper};
 use log::warn;
 use std::cell::RefCell;
@@ -415,7 +414,14 @@ where
                 continue;
             };
             let accepted_at = Instant::now();
-            let slot = self.provider.handshake_slot(peer.ip(), accepted_at);
+            // Refused rather than let through without a slot, which would leave
+            // it with no deadline and nothing able to evict it. Heard already,
+            // since QUIC's ClientHello rides in the Initial the peer sent to be
+            // here.
+            let Ok(slot) = self.provider.handshake_slot(peer.ip(), accepted_at, true) else {
+                incoming.refuse();
+                continue;
+            };
             // Everything already sharing the socket, this one included, so the
             // opening windows are a fair share rather than a guess. Read here
             // because this is the last place that holds the endpoint.
@@ -440,7 +446,7 @@ where
                     clippy::single_match,
                     reason = "the empty arm is where the reasoning lives"
                 )]
-                match handshake::bounded(slot, session).await {
+                match slot.run(session).await {
                     Some(Ok(request)) => {
                         handler(Session {
                             request,

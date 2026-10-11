@@ -227,19 +227,26 @@ pub trait ProvideGoalkeeper:
 
     /// Claims a slot for a handshake from `ip` that arrived at `accepted`.
     ///
-    /// [`None`] means there was no room and nothing evictable: every handshake
-    /// in flight is fast, so none deserves to be cancelled for a newcomer.
+    /// [`Refused`](crate::resource::handshake::Refused) means there was no room
+    /// and nothing evictable, and the connection should be closed without
+    /// handshaking: see that type.
     ///
     /// `accepted` is when the connection arrived rather than when the task
     /// carrying it was scheduled, so time spent waiting its turn counts against
     /// it.
+    ///
+    /// `hello` is whether the peer's ClientHello has already arrived, as it
+    /// has for QUIC, whose first packet carries it. Otherwise the handshake
+    /// says so once it does, through
+    /// [`Slot::hello`](crate::resource::handshake::Slot::hello).
     #[cfg(feature = "tls")]
     fn handshake_slot(
         &self,
         ip: IpAddr,
         accepted: Instant,
-    ) -> Option<crate::resource::handshake::Slot<Self>> {
-        crate::resource::handshake::slot(self, ip, accepted)
+        hello: bool,
+    ) -> Result<crate::resource::handshake::Slot<Self>, crate::resource::handshake::Refused> {
+        crate::resource::handshake::slot(self, ip, accepted, hello)
     }
 
     /// Reserves `bytes` that belong to no connection, or refuses.
@@ -709,9 +716,10 @@ impl Goalkeeper {
     /// whether or not its slot is wanted.
     ///
     /// Generous, since a client on a slow link legitimately needs a second or
-    /// two.
+    /// two, and one whose server reply is lost on a narrow path needs a few
+    /// more for the kernel to shrink it.
     ///
-    /// Default: `15s`, `3s`
+    /// Default: `15s`, `5s`
     #[cfg(feature = "tls")]
     pub fn set_handshake_deadline(&self, normal: Duration, pressured: Duration) {
         crate::resource::handshake::set_policy(self, |p, pressed| {
@@ -731,17 +739,19 @@ impl Goalkeeper {
         });
     }
 
-    /// Slow handshakes one address may hold at once.
+    /// Handshakes one address may hold in a full pool before even its fast
+    /// ones become evictable.
     ///
-    /// Qualified on slow, since an unqualified cap would punish a browser
-    /// opening several connections at once or a NAT presenting thousands of
-    /// clients as one address.
+    /// Only consulted once a newcomer finds no room: while there is room, an
+    /// address with many handshakes in flight — a NAT, a VPN exit, a browser
+    /// opening several connections — is in nobody's way. A quarter of the
+    /// capacity by default.
     ///
-    /// Default: `2`, `2`
+    /// Default: `8`, `4`
     #[cfg(feature = "tls")]
-    pub fn set_handshake_slow_per_ip(&self, normal: usize, pressured: usize) {
+    pub fn set_handshake_share(&self, normal: usize, pressured: usize) {
         crate::resource::handshake::set_policy(self, |p, pressed| {
-            p.slow_per_ip = if pressed { pressured } else { normal }
+            p.share = if pressed { pressured } else { normal }
         });
     }
 

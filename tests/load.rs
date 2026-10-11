@@ -309,7 +309,9 @@ fn a_slow_handshake_flood_cannot_hold_the_pool() {
     // is still usable, which is what the next block asks.
     let _held: Vec<_> = (0..50u64)
         .filter_map(|n| {
-            SystemGoalkeeper.handshake_slot(hostile, start + Duration::from_secs(n * 2))
+            SystemGoalkeeper
+                .handshake_slot(hostile, start + Duration::from_secs(n * 2), false)
+                .ok()
         })
         .collect();
 
@@ -317,10 +319,13 @@ fn a_slow_handshake_flood_cannot_hold_the_pool() {
     // this pass no matter how the pool behaved.
     let innocents: Vec<_> = (0..16u8)
         .filter_map(|n| {
-            SystemGoalkeeper.handshake_slot(
-                IpAddr::from([10, 41, 0, n]),
-                start + Duration::from_secs(100),
-            )
+            SystemGoalkeeper
+                .handshake_slot(
+                    IpAddr::from([10, 41, 0, n]),
+                    start + Duration::from_secs(100),
+                    false,
+                )
+                .ok()
         })
         .collect();
     assert_eq!(
@@ -328,6 +333,59 @@ fn a_slow_handshake_flood_cannot_hold_the_pool() {
         16,
         "innocent handshakes were refused because one address was dawdling"
     );
+}
+
+/// One address filling the whole pool, all inside the deadline so the reaper
+/// is no help: the pool is its while nobody else wants it, and newcomers from
+/// elsewhere get in by evicting it.
+#[test]
+#[cfg(feature = "tls")]
+fn one_address_filling_the_pool_gives_way() {
+    let _serial = serial();
+    let start = Instant::now();
+    let hostile = IpAddr::from([10, 42, 0, 1]);
+    // A fresh window, so the counts below are this test's alone.
+    let _ = SystemGoalkeeper.handshake_counts();
+
+    // More than the pool holds at any pressure, arriving within a second, so
+    // by the time the innocents come every one is slow and none has expired.
+    let held: Vec<_> = (0..40u64)
+        .filter_map(|n| {
+            SystemGoalkeeper
+                .handshake_slot(hostile, start + Duration::from_millis(n * 25), false)
+                .ok()
+        })
+        .collect();
+    assert_eq!(
+        held.len(),
+        40,
+        "with room, or only its own to evict, an address is never refused"
+    );
+
+    // Held, not dropped, as above.
+    let innocents: Vec<_> = (0..16u8)
+        .filter_map(|n| {
+            SystemGoalkeeper
+                .handshake_slot(
+                    IpAddr::from([10, 43, 0, n]),
+                    start + Duration::from_secs(3),
+                    false,
+                )
+                .ok()
+        })
+        .collect();
+    assert_eq!(
+        innocents.len(),
+        16,
+        "innocent handshakes were refused because one address filled the pool"
+    );
+
+    let counts = SystemGoalkeeper.handshake_counts();
+    assert!(
+        counts.peak >= 1.0,
+        "the pool never filled, so nothing here needed evicting"
+    );
+    assert_eq!(counts.refused, 0);
 }
 
 /// An address that has proved it carries many sessions gets more bandwidth than

@@ -81,7 +81,7 @@ fn runtime() -> tokio::runtime::Runtime {
 /// one loopback address, which is all of them coming from here.
 fn stand_down(gk: &Goalkeeper) {
     gk.set_handshake_capacity(4096, 4096);
-    gk.set_handshake_slow_per_ip(4096, 4096);
+    gk.set_handshake_share(4096, 4096);
     // Large rather than `u32::MAX`: a per-second rate is turned into a period
     // by dividing a second by it, and a rate above a billion rounds that period
     // to zero, which a debug build rightly refuses.

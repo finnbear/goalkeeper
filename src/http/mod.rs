@@ -253,17 +253,24 @@ impl<P: ProvideGoalkeeper> HttpServerBuilder<P> {
             let router = router.clone();
             let hyper = hyper.clone();
             let watcher = graceful.watcher();
-            // Built here rather than in the task below, so the configuration is
-            // derived once per certificate rather than once per connection.
+            // The configuration is built here rather than in the task below, so
+            // it is derived once per certificate rather than once per
+            // connection. The slot is claimed here too, like the refusals
+            // above, so a handshake the pool turns away costs no task: it is
+            // closed rather than allowed to handshake without a slot, which
+            // would leave it with no deadline and nothing able to evict it.
             #[cfg(feature = "tls")]
-            let acceptor = tls
-                .as_ref()
-                .map(|tls| tokio_rustls::TlsAcceptor::from(alpn.negotiating(tls)));
+            let secure = match &tls {
+                Some(tls) => match provider.handshake_slot(conn.ip(), accepted_at, false) {
+                    Ok(slot) => Some((alpn.negotiating(tls), slot)),
+                    Err(handshake::Refused) => {
+                        let _ = stream.set_zero_linger();
+                        continue;
+                    }
+                },
+                None => None,
+            };
             let priority = conn.priority().clone();
-            // Moved into the task, so a handshake takes its slot from the same
-            // instance that admitted the connection.
-            #[cfg(feature = "tls")]
-            let handshake_provider = provider.clone();
 
             provider
                 .spawn_with(priority.clone(), async move {
@@ -283,17 +290,31 @@ impl<P: ProvideGoalkeeper> HttpServerBuilder<P> {
                     }
 
                     #[cfg(feature = "tls")]
-                    if let Some(acceptor) = acceptor {
+                    if let Some((tls_config, slot)) = secure {
                         // Keepalive reaps only a dead peer, and hyper's header
                         // read timeout starts once TLS is up, so without a slot
                         // a peer that stalls mid-handshake holds a task
                         // indefinitely.
-                        let slot = handshake_provider.handshake_slot(conn.ip(), accepted_at);
+                        let hello = slot.hello();
+                        // In two halves, split at the ClientHello. A peer that
+                        // has not sent one by the time it is slow is no browser
+                        // on a slow link, whereas one that sent it and then
+                        // stalled may be, so the pool evicts it last. See
+                        // `handshake`.
+                        let accept = async {
+                            let start = tokio_rustls::LazyConfigAcceptor::new(
+                                rustls::server::Acceptor::default(),
+                                io,
+                            )
+                            .await?;
+                            hello.heard();
+                            start.into_stream(tls_config).await
+                        };
                         #[allow(
                             clippy::single_match,
                             reason = "the empty arm is where the reasoning lives"
                         )]
-                        match handshake::bounded(slot, acceptor.accept(io)).await {
+                        match slot.run(accept).await {
                             Some(Ok(stream)) => {
                                 let served = builder
                                     .serve_connection_with_upgrades(TokioIo::new(stream), service);

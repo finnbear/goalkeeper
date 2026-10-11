@@ -5,9 +5,23 @@
 //!
 //! A slot is not a reservation, since it can be held as cheaply as it can be
 //! used. A handshake taking longer than a real one plausibly takes is *slow*,
-//! and a slow handshake may be evicted, either by a newcomer that finds no room
-//! or by its own address holding too many. Fast handshakes are never evictable,
-//! so a flood of arrivals cannot cancel the work it displaces.
+//! and a slow handshake may be evicted by a newcomer that finds no room. Fast
+//! handshakes are not evictable, so a flood of arrivals cannot cancel the work
+//! it displaces — unless their address holds more than its share of a full
+//! pool, so that one address cannot fill it with handshakes too young to touch.
+//!
+//! Nothing is evicted while there is room. An address with many handshakes in
+//! flight is as often a VPN exit or a carrier NAT, or a browser opening several
+//! connections over a slow link, as an attacker, and while the pool has room
+//! none of them is in anyone's way. Only once it is full does the address
+//! holding the most give way first.
+//!
+//! A handshake whose peer has sent its ClientHello is evicted after one whose
+//! peer has not. Sending one costs an attacker nothing, so this is a tiebreak
+//! rather than protection: a peer that has not managed even that by the time it
+//! is slow is no browser on a slow link, whereas one that sent it and then
+//! stalled may well be, such as behind a tunnel dropping the server's full-size
+//! reply until the kernel shrinks it.
 //!
 //! There is no timer: a handshake past its deadline keeps its slot until
 //! somebody comes for it.
@@ -16,6 +30,7 @@ use crate::{Goalkeeper, ProvideGoalkeeper, SystemGoalkeeper};
 
 use fxhash::FxHashMap;
 use log::warn;
+use std::cmp::Reverse;
 use std::future::Future;
 use std::net::IpAddr;
 use std::sync::Mutex;
@@ -35,17 +50,19 @@ pub(crate) struct Policy {
     /// whether or not its slot is wanted.
     ///
     /// Generous, since a client on a slow link legitimately needs a second or
-    /// two.
+    /// two, and one whose server reply is lost on a narrow path needs a few
+    /// more for the kernel to shrink it.
     pub deadline: Duration,
     /// How long a handshake may take before it becomes evictable. Comfortably
     /// longer than the round trip or two a real one costs.
     pub slow: Duration,
-    /// Slow handshakes one address may hold at once.
+    /// Handshakes one address may hold in a full pool before even its fast
+    /// ones become evictable.
     ///
-    /// Qualified on slow, since an unqualified cap would punish a browser
-    /// opening several connections at once or a NAT presenting thousands of
-    /// clients as one address.
-    pub slow_per_ip: usize,
+    /// Applies only when a newcomer finds no room, since while there is room an
+    /// address with many handshakes is in nobody's way: it is as often a NAT,
+    /// a VPN exit or a browser opening several connections as an attacker.
+    pub share: usize,
 }
 
 impl Policy {
@@ -54,18 +71,24 @@ impl Policy {
         capacity: 32,
         deadline: Duration::from_secs(15),
         slow: Duration::from_secs(1),
-        slow_per_ip: 2,
+        share: 8,
     };
 
     /// What a host already short of CPU allows.
     ///
     /// Every number tightens together. A smaller pool with unchanged patience
     /// would shed more legitimate traffic per stalled handshake, not less.
+    ///
+    /// Except the deadline, which stays long enough for a handshake whose
+    /// server reply is lost on a narrow path to recover: the kernel takes a
+    /// second or three to notice and shrink it (`tcp_mtu_probing`), and a
+    /// deadline shorter than that reaps exactly the clients it should spare.
+    /// Pressure still evicts them sooner, through the smaller pool.
     pub const PRESSURED: Self = Self {
         capacity: 16,
-        deadline: Duration::from_secs(3),
+        deadline: Duration::from_secs(5),
         slow: Duration::from_millis(500),
-        slow_per_ip: 2,
+        share: 4,
     };
 }
 
@@ -130,16 +153,25 @@ fn interpolate(normal: Policy, pressured: Policy, at: f32) -> Policy {
         capacity: between(normal.capacity, pressured.capacity),
         deadline: over(normal.deadline, pressured.deadline),
         slow: over(normal.slow, pressured.slow),
-        slow_per_ip: between(normal.slow_per_ip, pressured.slow_per_ip),
+        share: between(normal.share, pressured.share),
     }
 }
+
+/// A handshake turned away: the pool was full and nothing in it was evictable.
+///
+/// The connection should be closed. Letting it handshake anyway, without a
+/// slot, would give it no deadline and make it impossible to evict, which is
+/// exactly what the pool exists to prevent.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct Refused;
 
 /// See [`crate::ProvideGoalkeeper::handshake_slot`].
 pub(crate) fn slot<P: ProvideGoalkeeper>(
     provider: &P,
     ip: IpAddr,
     accepted: Instant,
-) -> Option<Slot<P>> {
+    hello: bool,
+) -> Result<Slot<P>, Refused> {
     let gk: &Goalkeeper = provider;
     let policy = {
         let config = *gk.handshakes.config.lock().unwrap();
@@ -154,7 +186,7 @@ pub(crate) fn slot<P: ProvideGoalkeeper>(
     };
     let (slot, batch) = {
         let mut registry = gk.handshakes.registry.lock().unwrap();
-        let slot = registry.admit(ip, accepted, policy);
+        let slot = registry.admit(ip, accepted, hello, policy);
         (slot, registry.take_due_batch(accepted))
     };
     // Outside the lock: formatting a full batch is the slowest thing here, and
@@ -162,9 +194,9 @@ pub(crate) fn slot<P: ProvideGoalkeeper>(
     if let Some(batch) = batch {
         batch.log();
     }
-    let mut slot = slot?;
+    let mut slot = slot.ok_or(Refused)?;
     slot.provider = Some(provider.clone());
-    Some(slot)
+    Ok(slot)
 }
 
 /// See [`crate::ProvideGoalkeeper::handshake_counts`].
@@ -249,7 +281,7 @@ impl Batch {
         let seconds = self
             .started
             .map_or(0, |started| started.elapsed().as_secs());
-        Self::log_kind("expired", &self.killed, self.killed_unnamed, seconds);
+        Self::log_kind("killed", &self.killed, self.killed_unnamed, seconds);
         Self::log_kind("refused", &self.refused, self.refused_unnamed, seconds);
     }
 
@@ -287,7 +319,8 @@ pub struct Counts {
     pub attempts: u32,
     /// Turned away because nothing could be evicted for them.
     pub refused: u32,
-    /// Given up on, whether reaped past the deadline or evicted for being slow.
+    /// Given up on, whether reaped past the deadline or evicted to make room
+    /// for a newcomer.
     /// One number, since which rule reached it first says more about the
     /// constants than about the peer.
     pub killed: u32,
@@ -305,6 +338,8 @@ struct Entry {
     ip: IpAddr,
     /// When the connection was accepted, not when the task got around to it.
     accepted: Instant,
+    /// Whether the peer's ClientHello has arrived. See [`Hello`].
+    hello: bool,
     /// Dropped to evict. The handshake selects on the paired receiver, so
     /// removing an entry from the registry cancels it.
     _kill: oneshot::Sender<()>,
@@ -320,6 +355,9 @@ pub(crate) struct Registry {
     counts: Counts,
     /// Who the kills and refusals happened to, until there are enough to log.
     batch: Batch,
+    /// Handshakes per address, counted afresh by each arrival that finds the
+    /// pool full. Kept between arrivals only for its allocation.
+    holdings: FxHashMap<IpAddr, usize>,
 }
 
 impl Registry {
@@ -329,15 +367,20 @@ impl Registry {
     ///
     /// 1. Reap everything past [`Policy::deadline`]. Unconditional; an arrival
     ///    is the only clock this keeps.
-    /// 2. Enforce [`Policy::slow_per_ip`] against the arriving address, newest
-    ///    first, whether or not there is room.
-    /// 3. Take a free slot if there is one.
-    /// 4. Otherwise evict the oldest slow handshake, whoever owns it.
-    /// 5. Otherwise refuse.
+    /// 2. Take a free slot if there is one, whoever is asking and however many
+    ///    the address already holds.
+    /// 3. Otherwise evict one, if anything is evictable: a slow handshake, or
+    ///    any handshake of an address holding more than [`Policy::share`].
+    ///    Of those, one still waiting for its ClientHello before one that has
+    ///    heard it; then the address holding the most; then the oldest.
+    /// 4. Otherwise refuse.
+    ///
+    /// `hello` is whether the peer's ClientHello has already arrived.
     fn admit<P: ProvideGoalkeeper>(
         &mut self,
         ip: IpAddr,
         accepted: Instant,
+        hello: bool,
         policy: Policy,
     ) -> Option<Slot<P>> {
         let age = |entry: &Entry| accepted.saturating_duration_since(entry.accepted);
@@ -359,45 +402,27 @@ impl Registry {
             .killed
             .saturating_add((before - self.entries.len()) as u32);
 
-        // 2. The arriving address's own slow handshakes, newest first. `>=`
-        //    because the arrival is about to join them.
-        while self
-            .entries
-            .iter()
-            .filter(|e| e.ip == ip && slow(e))
-            .count()
-            >= policy.slow_per_ip
-        {
-            let Some(newest) = self
-                .entries
-                .iter()
-                .enumerate()
-                .filter(|(_, e)| e.ip == ip && slow(e))
-                .max_by_key(|(_, e)| e.accepted)
-                .map(|(index, _)| index)
-            else {
-                break;
-            };
-            self.entries.swap_remove(newest);
-            self.counts.killed = self.counts.killed.saturating_add(1);
-            self.batch.killed(ip, accepted);
-        }
-
-        // 3, 4 and 5.
+        // 2, 3 and 4. Counted only once the pool is full, since nothing else
+        //    needs the counts, and a full pool is bounded by its capacity.
         if self.entries.len() >= policy.capacity {
-            let Some(oldest) = self
+            let holdings = &mut self.holdings;
+            holdings.clear();
+            for entry in &self.entries {
+                *holdings.entry(entry.ip).or_default() += 1;
+            }
+            let Some(victim) = self
                 .entries
                 .iter()
                 .enumerate()
-                .filter(|(_, e)| slow(e))
-                .min_by_key(|(_, e)| e.accepted)
+                .filter(|(_, e)| slow(e) || holdings[&e.ip] > policy.share)
+                .min_by_key(|(_, e)| (e.hello, Reverse(holdings[&e.ip]), e.accepted))
                 .map(|(index, _)| index)
             else {
                 self.counts.refused = self.counts.refused.saturating_add(1);
                 self.batch.refused(ip, accepted);
                 return None;
             };
-            let evicted = self.entries.swap_remove(oldest);
+            let evicted = self.entries.swap_remove(victim);
             self.counts.killed = self.counts.killed.saturating_add(1);
             self.batch.killed(evicted.ip, accepted);
         }
@@ -409,6 +434,7 @@ impl Registry {
             id,
             ip,
             accepted,
+            hello,
             _kill,
         });
         // Sampled here because this is the only place the pool grows.
@@ -431,6 +457,14 @@ impl Registry {
         if let Some(index) = self.entries.iter().position(|e| e.id == id) {
             self.entries.swap_remove(index);
             self.counts.completed = self.counts.completed.saturating_add(1);
+        }
+    }
+
+    /// Records that `id`'s peer has sent its ClientHello, if `id` still holds a
+    /// slot.
+    fn heard(&mut self, id: u64) {
+        if let Some(entry) = self.entries.iter_mut().find(|e| e.id == id) {
+            entry.hello = true;
         }
     }
 
@@ -475,6 +509,37 @@ impl<P: ProvideGoalkeeper> Slot<P> {
         }
         // `self` drops here, returning the slot however this resolved.
     }
+
+    /// A handle for the handshake [`Self::run`] runs to say its peer's
+    /// ClientHello has arrived, which it alone can see.
+    ///
+    /// Taken before running, since running consumes the slot.
+    pub fn hello(&self) -> Hello<P> {
+        Hello {
+            id: self.id,
+            provider: self.provider.clone(),
+        }
+    }
+}
+
+/// Says that a [`Slot`]'s peer has sent its ClientHello.
+///
+/// Its handshake is then evicted only after every one that has not: see the
+/// module documentation.
+pub struct Hello<P: ProvideGoalkeeper = SystemGoalkeeper> {
+    id: u64,
+    /// As on the [`Slot`] it came from.
+    provider: Option<P>,
+}
+
+impl<P: ProvideGoalkeeper> Hello<P> {
+    /// Records it. Nothing happens if the handshake has already been evicted
+    /// or finished.
+    pub fn heard(&self) {
+        if let Some(provider) = &self.provider {
+            provider.handshakes.registry.lock().unwrap().heard(self.id);
+        }
+    }
 }
 
 impl<P: ProvideGoalkeeper> Drop for Slot<P> {
@@ -487,20 +552,6 @@ impl<P: ProvideGoalkeeper> Drop for Slot<P> {
                 .unwrap()
                 .release(self.id);
         }
-    }
-}
-
-/// Runs `future` under `slot` if there is one.
-///
-/// [`None`] for a listener with no crypto to ration, which runs unbounded.
-#[cfg(feature = "tls")]
-pub(crate) async fn bounded<F: Future, P: ProvideGoalkeeper>(
-    slot: Option<Slot<P>>,
-    future: F,
-) -> Option<F::Output> {
-    match slot {
-        Some(slot) => slot.run(future).await,
-        None => Some(future.await),
     }
 }
 
@@ -517,7 +568,7 @@ mod tests {
             capacity: 4,
             deadline: Duration::from_secs(5),
             slow: Duration::from_secs(1),
-            slow_per_ip: 2,
+            share: 2,
         }
     }
 
@@ -529,7 +580,7 @@ mod tests {
         /// [`Registry::admit`] with the provider pinned, so inference stops
         /// asking. The registry itself is instance-agnostic.
         fn admit_one(&mut self, ip: IpAddr, accepted: Instant) -> Option<Slot<SystemGoalkeeper>> {
-            self.admit(ip, accepted, policy())
+            self.admit(ip, accepted, false, policy())
         }
     }
 
@@ -570,39 +621,127 @@ mod tests {
         assert_eq!(registry.entries.len(), 4);
     }
 
+    /// A VPN exit, a carrier NAT, or a browser on a slow link: many slow
+    /// handshakes from one address, in nobody's way while there is room.
     #[test]
-    fn caps_slow_handshakes_per_address() {
+    fn a_shared_address_keeps_its_slow_handshakes_while_there_is_room() {
         let mut registry = Registry::default();
         let start = Instant::now();
-        let accepted = |registry: &Registry| {
-            let mut accepted: Vec<_> = registry.entries.iter().map(|e| e.accepted).collect();
-            accepted.sort();
-            accepted
-        };
-
-        for n in 0..3 {
+        for n in 0..4 {
             registry.admit_one(ip(1), at(start, n)).unwrap();
         }
-        assert_eq!(accepted(&registry), vec![at(start, 0), at(start, 2)]);
-
-        // And again, however long it keeps trying. Inside the deadline, so it
-        // is the cap doing this and not the reaper.
-        registry.admit_one(ip(1), at(start, 4)).unwrap();
-        assert_eq!(accepted(&registry), vec![at(start, 0), at(start, 4)]);
+        assert_eq!(
+            registry.entries.len(),
+            4,
+            "nothing evicted with room to spare"
+        );
     }
 
     #[test]
     fn one_address_cannot_hold_the_pool() {
         let mut registry = Registry::default();
         let start = Instant::now();
+        // Inside the deadline, so it is eviction that frees the pool below and
+        // not the reaper.
         for n in 0..20 {
-            registry.admit_one(ip(1), at(start, n * 2));
+            assert!(registry.admit_one(ip(1), at(start, n)).is_some());
         }
-        assert!(registry.entries.len() <= policy().slow_per_ip);
+        assert_eq!(registry.entries.len(), policy().capacity);
+        assert!(
+            registry.entries.iter().all(|e| e.ip == ip(1)),
+            "the whole pool, while nobody else wanted it"
+        );
         // So the rest of the pool is there for everyone else.
         for n in 2..6 {
-            assert!(registry.admit_one(ip(n), at(start, 40)).is_some());
+            assert!(registry.admit_one(ip(n), at(start, 20)).is_some());
         }
+        assert!(registry.entries.iter().all(|e| e.ip != ip(1)));
+    }
+
+    /// In a full pool, the address holding the most gives way before an older
+    /// handshake of an address holding one.
+    #[test]
+    fn the_biggest_holder_is_evicted_first() {
+        let mut registry = Registry::default();
+        let start = Instant::now();
+        registry.admit_one(ip(2), at(start, 0)).unwrap();
+        for n in 1..4 {
+            registry.admit_one(ip(1), at(start, n)).unwrap();
+        }
+        assert!(registry.admit_one(ip(9), at(start, 4)).is_some());
+        assert_eq!(registry.entries.iter().filter(|e| e.ip == ip(1)).count(), 2);
+        assert!(
+            registry.entries.iter().any(|e| e.ip == ip(2)),
+            "the lone, older handshake survives"
+        );
+        // And the biggest holder's oldest went, not its newest.
+        assert!(!registry.entries.iter().any(|e| e.accepted == at(start, 1)));
+    }
+
+    /// One address cannot fill a pool with handshakes too young to evict.
+    #[test]
+    fn an_address_over_its_share_loses_even_fast_handshakes() {
+        let mut registry = Registry::default();
+        let start = Instant::now();
+        registry.admit_one(ip(2), start).unwrap();
+        for _ in 0..3 {
+            registry.admit_one(ip(1), start).unwrap();
+        }
+        assert!(registry.admit_one(ip(9), start).is_some());
+        assert_eq!(registry.entries.iter().filter(|e| e.ip == ip(1)).count(), 2);
+        assert!(registry.entries.iter().any(|e| e.ip == ip(2)));
+    }
+
+    /// A handshake whose peer has sent its ClientHello is evicted after one
+    /// whose peer has not, however old: one that has not even sent that is no
+    /// browser on a slow link.
+    #[test]
+    fn handshakes_that_have_heard_hello_go_last() {
+        let mut registry = Registry::default();
+        let start = Instant::now();
+        let heard = registry.admit_one(ip(1), at(start, 0)).unwrap();
+        registry.heard(heard.id);
+        for n in 2..5 {
+            registry.admit_one(ip(n), at(start, n as u64)).unwrap();
+        }
+        assert!(registry.admit_one(ip(9), at(start, 4)).is_some());
+        assert!(
+            registry.entries.iter().any(|e| e.ip == ip(1)),
+            "the oldest, but it heard hello"
+        );
+        assert!(!registry.entries.iter().any(|e| e.ip == ip(2)));
+    }
+
+    /// Hello is a tiebreak among the evictable, not protection: a pool full of
+    /// slow handshakes that all heard it still takes newcomers. Heard on
+    /// arrival, as QUIC's are.
+    #[test]
+    fn hello_does_not_make_a_handshake_unevictable() {
+        let mut registry = Registry::default();
+        let start = Instant::now();
+        for n in 0..4 {
+            let slot: Option<Slot<SystemGoalkeeper>> =
+                registry.admit(ip(n), at(start, n as u64), true, policy());
+            assert!(slot.is_some());
+        }
+        assert!(registry.entries.iter().all(|e| e.hello));
+        assert!(registry.admit_one(ip(9), at(start, 4)).is_some());
+        assert!(!registry.entries.iter().any(|e| e.ip == ip(0)));
+    }
+
+    /// The many-addresses version of the slow flood: nobody over their share,
+    /// so it comes down to slow and old, and fast newcomers still get in.
+    #[test]
+    fn a_distributed_slow_flood_still_admits_newcomers() {
+        let mut registry = Registry::default();
+        let start = Instant::now();
+        for n in 0..4 {
+            registry.admit_one(ip(n), at(start, 0)).unwrap();
+        }
+        for n in 10..14 {
+            assert!(registry.admit_one(ip(n), at(start, 2)).is_some());
+        }
+        assert!(registry.entries.iter().all(|e| e.ip >= ip(10)));
     }
 
     #[test]
@@ -649,7 +788,8 @@ mod tests {
             capacity: 2,
             ..policy()
         };
-        let refused: Option<Slot<SystemGoalkeeper>> = registry.admit(ip(9), start, pressured);
+        let refused: Option<Slot<SystemGoalkeeper>> =
+            registry.admit(ip(9), start, false, pressured);
         assert!(refused.is_none());
         assert_eq!(registry.entries.len(), 4, "the ones running are left alone");
     }
@@ -757,14 +897,5 @@ mod tests {
         let mut registry = Registry::default();
         let slot = registry.admit_one(ip(1), Instant::now()).unwrap();
         assert_eq!(slot.run(async { 5u32 }).await, Some(5));
-    }
-
-    #[cfg(feature = "tls")]
-    #[tokio::test]
-    async fn a_listener_without_crypto_runs_unbounded() {
-        assert_eq!(
-            bounded(None::<Slot<SystemGoalkeeper>>, async { 7u32 }).await,
-            Some(7)
-        );
     }
 }

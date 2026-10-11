@@ -229,7 +229,7 @@ fn runtime() -> tokio::runtime::Runtime {
 /// the opposite: it is the one thing here that goalkeeper is *meant* to act on.
 fn configure() {
     SystemGoalkeeper.set_handshake_capacity(4096, 4096);
-    SystemGoalkeeper.set_handshake_slow_per_ip(4096, 4096);
+    SystemGoalkeeper.set_handshake_share(4096, 4096);
     // Large rather than `u32::MAX`: a per-second rate is turned into a period
     // by dividing a second by it, and a rate above a billion rounds that period
     // to zero.

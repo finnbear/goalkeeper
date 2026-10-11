@@ -365,9 +365,9 @@ fn on_baseline(n: usize) -> Report {
 ///
 /// QUIC goes through the handshake registry, which the TCP benchmarks never
 /// touch, and its defaults are the tightest thing in goalkeeper: 32 handshakes
-/// in flight and *two slow ones per address*. With 256 clients that are all
-/// `127.0.0.1`, that is indistinguishable from one machine opening 256
-/// connections at once, which is precisely what it exists to refuse. Before
+/// in flight, a quarter of them per address once the pool is full. With 256
+/// clients that are all `127.0.0.1`, that is indistinguishable from one machine
+/// opening 256 connections at once, which is precisely what it exists to refuse. Before
 /// this was stood down, goalkeeper completed zero round trips while the
 /// baseline, which has no such registry, ran at full speed.
 ///
@@ -377,7 +377,7 @@ fn on_baseline(n: usize) -> Report {
 /// most of what it is for.
 fn stand_down_the_limiter() {
     SystemGoalkeeper.set_handshake_capacity(4096, 4096);
-    SystemGoalkeeper.set_handshake_slow_per_ip(4096, 4096);
+    SystemGoalkeeper.set_handshake_share(4096, 4096);
     // Large rather than `u32::MAX`: a per-second rate is turned into a period
     // by dividing a second by it, and a rate above a billion rounds that period
     // to zero.

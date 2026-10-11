@@ -354,7 +354,7 @@ fn generous(gk: &ArcGoalkeeper) {
     gk.set_address_bandwidth_limits(PLENTY, PLENTY);
     gk.set_bandwidth_limits(u64::from(PLENTY), u64::from(PLENTY));
     gk.set_handshake_capacity(4096, 4096);
-    gk.set_handshake_slow_per_ip(4096, 4096);
+    gk.set_handshake_share(4096, 4096);
     // A limit at all, so reservations are booked rather than waved through: an
     // unlimited ledger authorises without recording, and would drain trivially.
     gk.set_memory_limit(256 * 1024 * 1024);
@@ -367,7 +367,7 @@ fn binding(gk: &ArcGoalkeeper) {
     gk.set_address_bandwidth_limits(LOW_BYTES, LOW_BYTES);
     gk.set_bandwidth_limits(u64::from(LOW_BYTES), u64::from(LOW_BYTES));
     gk.set_handshake_capacity(1, 1);
-    gk.set_handshake_slow_per_ip(1, 1);
+    gk.set_handshake_share(1, 1);
     gk.set_memory_limit(LOW_MEMORY);
 }
 
