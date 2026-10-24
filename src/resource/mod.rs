@@ -204,8 +204,11 @@ const LONG_STALL_CAP: f32 = 1.5;
 fn lateness_severity(late: f32, floor: f32) -> f32 {
     // Kept under one, so the linear part has a span to rise over.
     let floor = floor.clamp(0.0, 0.99);
-    // Written to be false for NaN, which is no evidence either.
-    if !(late >= floor) {
+    // Nothing for NaN either, which is no evidence: incomparable is `None`.
+    if late
+        .partial_cmp(&floor)
+        .is_none_or(std::cmp::Ordering::is_lt)
+    {
         0.0
     } else if late <= 1.0 {
         (late - floor) / (1.0 - floor)

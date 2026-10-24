@@ -529,6 +529,7 @@ async fn run(
         connections, 0,
         "connection permits outlived their connections"
     );
+    assert_eq!(gk.borrowed_connections(), 0, "loans outlived their permits");
     assert!(
         charged.is_empty(),
         "an address is still charged for guards nobody holds: {charged:?}"

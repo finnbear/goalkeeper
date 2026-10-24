@@ -65,6 +65,7 @@ pub mod conn;
 pub mod executor;
 #[cfg(feature = "http")]
 pub mod http;
+pub(crate) mod ip_map;
 pub mod rate_limiter;
 pub mod resource;
 pub mod tcp;
@@ -209,20 +210,20 @@ pub trait ProvideGoalkeeper:
         // round here would be a lock-order inversion. Passed in rather than
         // read from within, so the limiter answers about this instance.
         let strained = self.strained();
-        let ip = self
+        let grant = self
             .limiter
             .with(|limiter| limiter.connection_permit(ip, label, strained))?;
-        Some(ConnectionPermit::new(ip, self.clone()))
+        Some(ConnectionPermit::new(grant, self.clone()))
     }
 
     /// Marks `ip` as carrying meaningful activity for as long as the guard
     /// lives.
     ///
-    /// This is what earns an address a larger allowance, so take one only once
+    /// This is what earns its source a larger allowance, so take one only once
     /// something has established the session is real.
     fn active_session(&self, ip: IpAddr) -> ActiveSession<Self> {
-        self.limiter.with(|limiter| limiter.enter_session(ip));
-        ActiveSession::new(ip, self.clone())
+        let source = self.limiter.with(|limiter| limiter.enter_session(ip));
+        ActiveSession::new(source, self.clone())
     }
 
     /// Claims a slot for a handshake from `ip` that arrived at `accepted`.
@@ -280,7 +281,7 @@ impl Goalkeeper {
         self.limiter.with(|limiter| limiter.over_bandwidth(ip, dir))
     }
 
-    /// Rate limits some custom, expensive action per address. `true` means
+    /// Rate limits some custom, expensive action per source. `true` means
     /// block it.
     pub fn should_limit_custom(&self, ip: IpAddr, usage: Units) -> bool {
         let now = Instant::now();
@@ -288,19 +289,26 @@ impl Goalkeeper {
             .with(|limiter| limiter.should_limit_custom(ip, usage, now))
     }
 
-    /// Visits the statistics for each tracked address. The visitor must not
-    /// block.
+    /// Visits the statistics for each tracked source, keyed by its address
+    /// masked to the source prefixes (see [`Self::set_source_prefixes`]): with
+    /// the defaults, each address. The visitor must not block.
     pub fn address_stats(&self, mut visitor: impl FnMut(IpAddr, IpStats)) {
         self.limiter.with(|limiter| {
-            for (ip, stats) in limiter.stats() {
-                visitor(ip, stats);
+            for (source, stats) in limiter.stats() {
+                visitor(source, stats);
             }
         })
     }
 
-    /// Outstanding [`ConnectionPermit`]s across all addresses.
+    /// Outstanding [`ConnectionPermit`]s across all sources.
     pub fn total_connections(&self) -> u32 {
         self.limiter.with(|limiter| limiter.total_connections())
+    }
+
+    /// Of [`Self::total_connections`], those borrowed beyond their sources'
+    /// allowances (see [`Self::set_borrow`]).
+    pub fn borrowed_connections(&self) -> u32 {
+        self.limiter.with(|limiter| limiter.borrowed())
     }
 
     /// Connections the limiter was asked about, and how many it withheld, since
@@ -313,7 +321,61 @@ impl Goalkeeper {
         self.limiter.with(|limiter| limiter.take_permit_counts())
     }
 
-    /// Bytes per second one address may move before being throttled, and how
+    /// The prefixes an IPv4 and an IPv6 address are masked to, to make the
+    /// source it is limited as: every limit of the limiter's is per source
+    /// (the handshake pool's share has prefixes of its own; see
+    /// `set_handshake_share_prefixes`). `24` and `48`
+    /// limit by network, so an attacker holding many addresses of one gains
+    /// nothing by spreading across them; give a source with several players
+    /// more through its sessions, and the per-session allowances.
+    ///
+    /// Set it before admitting connections. Sources already tracked keep
+    /// their keys, and are forgotten once idle.
+    ///
+    /// Default: `32`, `128` (each address its own source)
+    pub fn set_source_prefixes(&self, v4: u8, v6: u8) {
+        self.limiter
+            .with(|limiter| limiter.set_source_prefixes(v4, v6));
+    }
+
+    /// Connections that sources past their allowance may have borrowed at
+    /// once, in all: a pool shared by every source, within the hard
+    /// connection limit (see [`Self::set_total_connection_limits`]). A source
+    /// limited recently (see [`Self::set_ddos_memory`]) may not borrow; a new
+    /// one may. Whichever of a source's permits drops, one of its loans is
+    /// returned before any of its own slots is freed. Zero turns borrowing
+    /// off, as does zero per bank (see [`Self::set_borrow_per_bank`]).
+    ///
+    /// Default: `200`
+    pub fn set_borrow(&self, connections: u32) {
+        self.limiter.with(|limiter| limiter.set_borrow(connections));
+    }
+
+    /// The prefixes an IPv4 and an IPv6 address are masked to, to make the
+    /// bank its source borrows against (see [`Self::set_borrow_per_bank`]).
+    /// Zero makes one bank of everything, the pool alone bounding borrowing.
+    ///
+    /// Treated as no longer than the source prefixes (see
+    /// [`Self::set_source_prefixes`]), so a source falls in one bank rather
+    /// than borrowing a share from each of many.
+    ///
+    /// Default: `8`, `16`
+    pub fn set_borrow_prefixes(&self, v4: u8, v6: u8) {
+        self.limiter
+            .with(|limiter| limiter.set_borrow_prefixes(v4, v6));
+    }
+
+    /// Connections one bank's sources may have borrowed at once, so that no
+    /// one network takes the whole pool. Zero turns borrowing off, whatever
+    /// the banks' size.
+    ///
+    /// Default: `20`
+    pub fn set_borrow_per_bank(&self, connections: u32) {
+        self.limiter
+            .with(|limiter| limiter.set_borrow_per_bank(connections));
+    }
+
+    /// Bytes per second one source may move before being throttled, and how
     /// many in a burst, both before scaling for active sessions.
     ///
     /// The rate must be under a billion: a period is derived by dividing a
@@ -327,7 +389,7 @@ impl Goalkeeper {
 
     /// How much of the base allowance each active session adds.
     ///
-    /// One means an address with three sessions gets four times the base. Zero
+    /// One means a source with three sessions gets four times the base. Zero
     /// disables scaling.
     ///
     /// Default: `1`
@@ -336,8 +398,11 @@ impl Goalkeeper {
             .with(|limiter| limiter.set_per_active_session(factor));
     }
 
-    /// Connections per active session an address may hold, ordinarily and for
-    /// the rare address that has earned the benefit of the doubt.
+    /// Connections per active session a source may hold while strained (under
+    /// a recent global soft limit, for a source new or recently limited), and
+    /// ordinarily. A source holds (sessions + 1) times one of them, one more
+    /// while not strained; past that, it may borrow (see
+    /// [`Self::set_borrow`]).
     ///
     /// For an HTTP/1-only server, 4–6; for HTTP/2 with HTTP/1 WebSockets, 2;
     /// for HTTP/2 throughout, 1.
@@ -348,7 +413,7 @@ impl Goalkeeper {
             .with(|limiter| limiter.set_connections_per_active(p90, p99));
     }
 
-    /// Connections across all addresses before each address is afforded fewer,
+    /// Connections across all sources before each source is afforded fewer,
     /// and before new ones are refused outright.
     ///
     /// Default: `1000`, `2000`
@@ -739,11 +804,11 @@ impl Goalkeeper {
         });
     }
 
-    /// Handshakes one address may hold in a full pool before even its fast
-    /// ones become evictable.
+    /// Handshakes one network (see [`Self::set_handshake_share_prefixes`]) may
+    /// hold in a full pool before even its fast ones become evictable.
     ///
-    /// Only consulted once a newcomer finds no room: while there is room, an
-    /// address with many handshakes in flight — a NAT, a VPN exit, a browser
+    /// Only consulted once a newcomer finds no room: while there is room, a
+    /// network with many handshakes in flight — a NAT, a VPN exit, a browser
     /// opening several connections — is in nobody's way. A quarter of the
     /// capacity by default.
     ///
@@ -753,6 +818,22 @@ impl Goalkeeper {
         crate::resource::handshake::set_policy(self, |p, pressed| {
             p.share = if pressed { pressured } else { normal }
         });
+    }
+
+    /// The prefixes an IPv4 and an IPv6 address are masked to, to make the
+    /// source whose handshakes count against one share (see
+    /// [`Self::set_handshake_share`]). Networks rather than addresses by
+    /// default, so that one cannot spread its handshakes across its addresses
+    /// to keep each under its share; `32` and `128` share per address.
+    ///
+    /// Separate from [`Self::set_source_prefixes`], since a share is a slice of
+    /// a small pool, and a network that is one source for connections may be
+    /// too many players to squeeze into one share of handshakes.
+    ///
+    /// Default: `24`, `48`
+    #[cfg(feature = "tls")]
+    pub fn set_handshake_share_prefixes(&self, v4: u8, v6: u8) {
+        crate::resource::handshake::set_share_prefixes(self, v4, v6);
     }
 
     // ------------------------------------------------------------ bandwidth

@@ -2,8 +2,9 @@
 //!
 //! Two independent limits. The **congestion limit** is global: the budget is
 //! spent best levels first, and everything worse than the level it runs out at
-//! stops being read. The **per-address allowance** is per IP and scales with
-//! how many active sessions that address holds, so a carrier-grade NAT
+//! stops being read. The **per-address allowance** is per source (an address,
+//! or its network; see [`crate::Goalkeeper::set_source_prefixes`]) and scales
+//! with how many active sessions that source holds, so a carrier-grade NAT
 //! presenting a hundred players is not held to one player's ration.
 //!
 //! # Backpressure, not refusal

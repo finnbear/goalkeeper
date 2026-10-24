@@ -7,13 +7,15 @@
 //! used. A handshake taking longer than a real one plausibly takes is *slow*,
 //! and a slow handshake may be evicted by a newcomer that finds no room. Fast
 //! handshakes are not evictable, so a flood of arrivals cannot cancel the work
-//! it displaces — unless their address holds more than its share of a full
-//! pool, so that one address cannot fill it with handshakes too young to touch.
+//! it displaces — unless their network, a `/24` or `/48` by default, holds
+//! more than its share of a full pool, so that one network cannot fill it with
+//! handshakes too young to touch, however many of its addresses it spreads them
+//! across.
 //!
-//! Nothing is evicted while there is room. An address with many handshakes in
+//! Nothing is evicted while there is room. A network with many handshakes in
 //! flight is as often a VPN exit or a carrier NAT, or a browser opening several
 //! connections over a slow link, as an attacker, and while the pool has room
-//! none of them is in anyone's way. Only once it is full does the address
+//! none of them is in anyone's way. Only once it is full does the network
 //! holding the most give way first.
 //!
 //! A handshake whose peer has sent its ClientHello is evicted after one whose
@@ -26,6 +28,7 @@
 //! There is no timer: a handshake past its deadline keeps its slot until
 //! somebody comes for it.
 
+use crate::resource::ip_limiter::mask;
 use crate::{Goalkeeper, ProvideGoalkeeper, SystemGoalkeeper};
 
 use fxhash::FxHashMap;
@@ -56,7 +59,8 @@ pub(crate) struct Policy {
     /// How long a handshake may take before it becomes evictable. Comfortably
     /// longer than the round trip or two a real one costs.
     pub slow: Duration,
-    /// Handshakes one address may hold in a full pool before even its fast
+    /// Handshakes one source, an address masked to [`Config::share_prefixes`],
+    /// may hold in a full pool before even its fast
     /// ones become evictable.
     ///
     /// Applies only when a newcomer finds no room, since while there is room an
@@ -101,6 +105,10 @@ pub(crate) struct Config {
     /// says nothing about crypto. See
     /// [`crate::resource::Pressure::worst_compute`].
     pub pressured: Policy,
+    /// The prefixes an IPv4 and an IPv6 address are masked to, to make the
+    /// source whose handshakes count against one [`Policy::share`]. Not part
+    /// of [`Policy`], since it does not move with pressure.
+    pub share_prefixes: (u8, u8),
 }
 
 impl Default for Config {
@@ -108,6 +116,7 @@ impl Default for Config {
         Self {
             normal: Policy::NORMAL,
             pressured: Policy::PRESSURED,
+            share_prefixes: (24, 48),
         }
     }
 }
@@ -133,6 +142,11 @@ pub(crate) fn set_policy(gk: &Goalkeeper, f: impl Fn(&mut Policy, bool)) {
     let mut config = gk.handshakes.config.lock().unwrap();
     f(&mut config.normal, false);
     f(&mut config.pressured, true);
+}
+
+/// See [`crate::Goalkeeper::set_handshake_share_prefixes`].
+pub(crate) fn set_share_prefixes(gk: &Goalkeeper, v4: u8, v6: u8) {
+    gk.handshakes.config.lock().unwrap().share_prefixes = (v4.min(32), v6.min(128));
 }
 
 /// Where the pool currently sits between its two policies, in `0..=1`.
@@ -173,20 +187,21 @@ pub(crate) fn slot<P: ProvideGoalkeeper>(
     hello: bool,
 ) -> Result<Slot<P>, Refused> {
     let gk: &Goalkeeper = provider;
-    let policy = {
+    let (policy, source) = {
         let config = *gk.handshakes.config.lock().unwrap();
         // Compute strain rather than strain in general, since a saturated
         // uplink is no reason to shrink this pool. A position rather than a
         // verdict; see `interpolate`.
-        interpolate(
+        let policy = interpolate(
             config.normal,
             config.pressured,
             crate::resource::compute_glide_of(gk),
-        )
+        );
+        (policy, mask(ip, config.share_prefixes))
     };
     let (slot, batch) = {
         let mut registry = gk.handshakes.registry.lock().unwrap();
-        let slot = registry.admit(ip, accepted, hello, policy);
+        let slot = registry.admit(ip, source, accepted, hello, policy);
         (slot, registry.take_due_batch(accepted))
     };
     // Outside the lock: formatting a full batch is the slowest thing here, and
@@ -336,6 +351,9 @@ pub struct Counts {
 struct Entry {
     id: u64,
     ip: IpAddr,
+    /// `ip` masked to [`Config::share_prefixes`] when it arrived: what its
+    /// share is counted against.
+    source: IpAddr,
     /// When the connection was accepted, not when the task got around to it.
     accepted: Instant,
     /// Whether the peer's ClientHello has arrived. See [`Hello`].
@@ -355,7 +373,7 @@ pub(crate) struct Registry {
     counts: Counts,
     /// Who the kills and refusals happened to, until there are enough to log.
     batch: Batch,
-    /// Handshakes per address, counted afresh by each arrival that finds the
+    /// Handshakes per source, counted afresh by each arrival that finds the
     /// pool full. Kept between arrivals only for its allocation.
     holdings: FxHashMap<IpAddr, usize>,
 }
@@ -370,15 +388,17 @@ impl Registry {
     /// 2. Take a free slot if there is one, whoever is asking and however many
     ///    the address already holds.
     /// 3. Otherwise evict one, if anything is evictable: a slow handshake, or
-    ///    any handshake of an address holding more than [`Policy::share`].
+    ///    any handshake of a source holding more than [`Policy::share`].
     ///    Of those, one still waiting for its ClientHello before one that has
-    ///    heard it; then the address holding the most; then the oldest.
+    ///    heard it; then the source holding the most; then the oldest.
     /// 4. Otherwise refuse.
     ///
-    /// `hello` is whether the peer's ClientHello has already arrived.
+    /// `source` is `ip` masked to [`Config::share_prefixes`]. `hello` is
+    /// whether the peer's ClientHello has already arrived.
     fn admit<P: ProvideGoalkeeper>(
         &mut self,
         ip: IpAddr,
+        source: IpAddr,
         accepted: Instant,
         hello: bool,
         policy: Policy,
@@ -408,14 +428,14 @@ impl Registry {
             let holdings = &mut self.holdings;
             holdings.clear();
             for entry in &self.entries {
-                *holdings.entry(entry.ip).or_default() += 1;
+                *holdings.entry(entry.source).or_default() += 1;
             }
             let Some(victim) = self
                 .entries
                 .iter()
                 .enumerate()
-                .filter(|(_, e)| slow(e) || holdings[&e.ip] > policy.share)
-                .min_by_key(|(_, e)| (e.hello, Reverse(holdings[&e.ip]), e.accepted))
+                .filter(|(_, e)| slow(e) || holdings[&e.source] > policy.share)
+                .min_by_key(|(_, e)| (e.hello, Reverse(holdings[&e.source]), e.accepted))
                 .map(|(index, _)| index)
             else {
                 self.counts.refused = self.counts.refused.saturating_add(1);
@@ -433,6 +453,7 @@ impl Registry {
         self.entries.push(Entry {
             id,
             ip,
+            source,
             accepted,
             hello,
             _kill,
@@ -580,7 +601,7 @@ mod tests {
         /// [`Registry::admit`] with the provider pinned, so inference stops
         /// asking. The registry itself is instance-agnostic.
         fn admit_one(&mut self, ip: IpAddr, accepted: Instant) -> Option<Slot<SystemGoalkeeper>> {
-            self.admit(ip, accepted, false, policy())
+            self.admit(ip, ip, accepted, false, policy())
         }
     }
 
@@ -658,6 +679,29 @@ mod tests {
         assert!(registry.entries.iter().all(|e| e.ip != ip(1)));
     }
 
+    /// With the share counted per network, spreading fast handshakes across
+    /// its addresses does not keep a network under its share.
+    #[test]
+    fn a_network_spread_across_addresses_cannot_hold_the_pool() {
+        let mut registry = Registry::default();
+        let start = Instant::now();
+        let network = mask(ip(0), (24, 48));
+        for n in 0..4 {
+            registry
+                .admit::<SystemGoalkeeper>(ip(n), network, start, false, policy())
+                .unwrap();
+        }
+        // Each address holds one, but the /24 holds four, over its share of
+        // two, so even its fast handshakes give way.
+        let elsewhere = IpAddr::from([10, 0, 1, 1]);
+        assert!(
+            registry
+                .admit::<SystemGoalkeeper>(elsewhere, elsewhere, start, false, policy())
+                .is_some()
+        );
+        assert!(registry.entries.iter().any(|e| e.ip == elsewhere));
+    }
+
     /// In a full pool, the address holding the most gives way before an older
     /// handshake of an address holding one.
     #[test]
@@ -721,7 +765,7 @@ mod tests {
         let start = Instant::now();
         for n in 0..4 {
             let slot: Option<Slot<SystemGoalkeeper>> =
-                registry.admit(ip(n), at(start, n as u64), true, policy());
+                registry.admit(ip(n), ip(n), at(start, n as u64), true, policy());
             assert!(slot.is_some());
         }
         assert!(registry.entries.iter().all(|e| e.hello));
@@ -789,7 +833,7 @@ mod tests {
             ..policy()
         };
         let refused: Option<Slot<SystemGoalkeeper>> =
-            registry.admit(ip(9), start, false, pressured);
+            registry.admit(ip(9), ip(9), start, false, pressured);
         assert!(refused.is_none());
         assert_eq!(registry.entries.len(), 4, "the ones running are left alone");
     }
