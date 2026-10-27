@@ -76,10 +76,13 @@ pub mod web_transport;
 use crate::rate_limiter::{RateLimiterProps, Units};
 use crate::resource::Pressure;
 use crate::resource::bandwidth::Direction;
-use crate::resource::ip_limiter::{ActiveSession, ConnectionPermit, IpStats};
+use crate::resource::ip_limiter::{ActiveSession, ConnectionPermit, IpStats, PoolStats, Pools};
 use std::net::IpAddr;
 use std::sync::atomic::AtomicU64;
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, RwLock};
+
+/// Says which pools an address belongs to (see [`Goalkeeper::set_pools`]).
+pub type PoolsOf = Arc<dyn Fn(IpAddr) -> Pools + Send + Sync>;
 use std::time::{Duration, Instant};
 
 /// The process's one instance, behind [`SystemGoalkeeper`].
@@ -122,6 +125,10 @@ pub struct Goalkeeper {
     /// behind the same lock, the bandwidth ledger, which divides the link
     /// between priorities.
     pub(crate) limiter: crate::resource::ip_limiter::IpLimiter,
+    /// Which pools an address belongs to (see [`Self::set_pools`]). Behind a
+    /// lock of its own, read and released before the limiter's is taken, so
+    /// the caller's function never runs inside the limiter's lock.
+    pub(crate) pools: RwLock<Option<PoolsOf>>,
     /// Handshake slots, which ration concurrent crypto.
     #[cfg(feature = "tls")]
     pub(crate) handshakes: crate::resource::handshake::HandshakeSemaphore,
@@ -169,6 +176,7 @@ impl Goalkeeper {
         Self {
             executor,
             limiter: Default::default(),
+            pools: Default::default(),
             #[cfg(feature = "tls")]
             handshakes: Default::default(),
             controller: Default::default(),
@@ -210,9 +218,10 @@ pub trait ProvideGoalkeeper:
         // round here would be a lock-order inversion. Passed in rather than
         // read from within, so the limiter answers about this instance.
         let strained = self.strained();
+        let pools = self.pools_of(ip);
         let grant = self
             .limiter
-            .with(|limiter| limiter.connection_permit(ip, label, strained))?;
+            .with(|limiter| limiter.connection_permit(ip, label, strained, &pools))?;
         Some(ConnectionPermit::new(grant, self.clone()))
     }
 
@@ -319,6 +328,34 @@ impl Goalkeeper {
     /// second would silently take part of the first's window.
     pub fn permit_counts(&self) -> (u32, u32) {
         self.limiter.with(|limiter| limiter.take_permit_counts())
+    }
+
+    /// Says which [`Pool`](crate::resource::ip_limiter::Pool)s each address
+    /// belongs to from now on: each a cap on the connections all of its
+    /// addresses hold at once, which no session widens. `None` for none.
+    ///
+    /// `pools_of` is asked once per connection, outside any of the limiter's
+    /// locks, so it may be as slow as a lookup, not as slow as I/O. A
+    /// connection already permitted keeps counting against the pools it was
+    /// in, whatever is set later.
+    pub fn set_pools(&self, pools_of: Option<PoolsOf>) {
+        *self.pools.write().unwrap() = pools_of;
+    }
+
+    /// Each pool's statistics since this was last asked, by id: what it holds
+    /// now, its peak, and the connections past its cap. A pool that holds
+    /// nothing is forgotten once reported.
+    ///
+    /// Reading resets, as [`Self::permit_counts`] does; there should be one
+    /// caller.
+    pub fn take_pool_stats(&self) -> Vec<(std::num::NonZeroU16, PoolStats)> {
+        self.limiter.with(|limiter| limiter.take_pool_stats())
+    }
+
+    /// The pools `ip` belongs to, as [`Self::set_pools`] says.
+    fn pools_of(&self, ip: IpAddr) -> Pools {
+        let pools_of = self.pools.read().unwrap().clone();
+        pools_of.map_or_else(Pools::new, |pools_of| pools_of(ip))
     }
 
     /// The prefixes an IPv4 and an IPv6 address are masked to, to make the

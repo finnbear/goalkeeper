@@ -28,6 +28,11 @@
 //! source's connections closes, it is one nearer its allowance, so a loan is
 //! returned before an own slot is freed: a source does not keep borrowing once
 //! its own connections would cover it.
+//!
+//! Besides its source, an address may belong to [`Pool`]s, as the caller says
+//! (see [`crate::Goalkeeper::set_pools`]): each a cap on the connections all of
+//! its addresses hold at once, which no session widens. A connection counts
+//! against each of its pools for its life, whatever the pools say later.
 
 use crate::ip_map::{Entry, IpMap};
 use crate::rate_limiter::{RateLimiterProps, RateLimiterState, Units};
@@ -35,6 +40,7 @@ use crate::resource::bandwidth::Direction;
 use crate::{ProvideGoalkeeper, SystemGoalkeeper};
 use log::warn;
 use std::net::IpAddr;
+use std::num::NonZeroU16;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -260,8 +266,64 @@ pub struct IpStats {
     pub last_limit: Option<Instant>,
 }
 
-/// What the limiter granted a connection: the address, and the source it was
-/// counted against.
+/// The most [`Pool`]s one address belongs to.
+pub const MAX_POOLS: usize = 4;
+
+/// A cap on the connections held at once by every address in it, together,
+/// whatever their sources' own allowances. Which addresses are in which pools
+/// is the caller's to say (see [`crate::Goalkeeper::set_pools`]).
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct Pool {
+    /// Names the pool: addresses given the same id share its count. Nonzero,
+    /// so that a connection's record of its pools stays small.
+    pub id: NonZeroU16,
+    /// Connections its addresses may hold at once, together.
+    pub cap: u32,
+    /// Whether a connection past the cap is refused, rather than let in and
+    /// counted as [`PoolStats::over`].
+    pub enforce: bool,
+}
+
+/// The pools one address belongs to, at most [`MAX_POOLS`].
+#[derive(Copy, Clone, Debug, Default)]
+pub struct Pools([Option<Pool>; MAX_POOLS]);
+
+impl Pools {
+    /// In no pool.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// In `pool` as well. Past [`MAX_POOLS`], ignored (a debug build panics).
+    pub fn with(mut self, pool: Pool) -> Self {
+        let free = self.0.iter_mut().find(|slot| slot.is_none());
+        debug_assert!(free.is_some(), "more than {MAX_POOLS} pools");
+        if let Some(slot) = free {
+            *slot = Some(pool);
+        }
+        self
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &Pool> {
+        self.0.iter().flatten()
+    }
+}
+
+/// What one pool held and turned away since its statistics were last taken
+/// (see [`crate::Goalkeeper::take_pool_stats`]).
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct PoolStats {
+    /// Connections it holds now.
+    pub connections: u32,
+    /// The most it held at once.
+    pub peak: u32,
+    /// Connections past its cap: refused if it is enforced, else let in.
+    pub over: u32,
+}
+
+/// What the limiter granted a connection: the address, the source it was
+/// counted against, and the pools it counts against.
 ///
 /// Not whether it was borrowed, since loans belong to the source rather than
 /// to any one connection (see the module docs).
@@ -269,6 +331,7 @@ pub struct IpStats {
 pub(crate) struct Grant {
     ip: IpAddr,
     source: IpAddr,
+    pools: [Option<NonZeroU16>; MAX_POOLS],
 }
 
 /// A permissible, long-lived connection. Hold it for the connection's life.
@@ -350,6 +413,9 @@ pub(crate) struct Addresses {
     banks: IpMap<u32>,
     /// Connections borrowed in all.
     borrowed: u32,
+    /// Each [`Pool`] by id, while it holds a connection or has statistics
+    /// not yet taken.
+    pools: fxhash::FxHashMap<NonZeroU16, PoolStats>,
     next_prune: Instant,
     warning_limiter: RateLimiterState,
     total_connections: u32,
@@ -366,6 +432,7 @@ impl Default for Addresses {
             usage: IpMap::default(),
             banks: IpMap::default(),
             borrowed: 0,
+            pools: Default::default(),
             next_prune: Instant::now(),
             warning_limiter: RateLimiterState::default(),
             total_connections: 0,
@@ -473,6 +540,18 @@ impl Addresses {
             std::mem::take(&mut self.permits),
             std::mem::take(&mut self.permits_withheld),
         )
+    }
+
+    /// Each pool's statistics since they were last taken, starting them
+    /// afresh, and forgetting a pool that holds nothing.
+    pub(crate) fn take_pool_stats(&mut self) -> Vec<(NonZeroU16, PoolStats)> {
+        let taken = self.pools.iter().map(|(id, stats)| (*id, *stats)).collect();
+        self.pools.retain(|_, stats| {
+            stats.peak = stats.connections;
+            stats.over = 0;
+            stats.connections > 0
+        });
+        taken
     }
 
     #[allow(dead_code, reason = "read back for symmetry with the setter")]
@@ -596,7 +675,8 @@ impl Addresses {
             .or_insert_with(|| Usage::new(Instant::now()))
     }
 
-    /// Whether `ip` may open another connection, and the accounting either way.
+    /// Whether `ip`, in `pools`, may open another connection, and the
+    /// accounting either way.
     ///
     /// Returns what was granted rather than a guard, since a guard must carry
     /// the handle that issued it and this runs inside the lock. The caller
@@ -606,6 +686,7 @@ impl Addresses {
         ip: IpAddr,
         label: &'static str,
         strained: bool,
+        pools: &Pools,
     ) -> Option<Grant> {
         self.permits = self.permits.saturating_add(1);
         let now = Instant::now();
@@ -615,6 +696,23 @@ impl Addresses {
         if self.total_connections >= config.total_connections_hard_limit {
             self.permits_withheld = self.permits_withheld.saturating_add(1);
             self.warn(ip, label, "host is at its connection ceiling", now);
+            return None;
+        }
+
+        // A pool at its cap refuses, if enforced, before the source is charged
+        // anything: the source did nothing wrong.
+        if let Some(full) = pools.iter().find(|pool| {
+            pool.enforce
+                && self
+                    .pools
+                    .get(&pool.id)
+                    .map_or(0, |stats| stats.connections)
+                    >= pool.cap
+        }) {
+            let stats = self.pools.entry(full.id).or_default();
+            stats.over = stats.over.saturating_add(1);
+            self.permits_withheld = self.permits_withheld.saturating_add(1);
+            self.warn(ip, label, "its pool is full", now);
             return None;
         }
 
@@ -709,7 +807,21 @@ impl Addresses {
 
         usage.connections += 1;
         self.total_connections += 1;
-        Some(Grant { ip, source })
+        let mut counted = [None; MAX_POOLS];
+        for (slot, pool) in counted.iter_mut().zip(pools.iter()) {
+            let stats = self.pools.entry(pool.id).or_default();
+            stats.connections += 1;
+            stats.peak = stats.peak.max(stats.connections);
+            if stats.connections > pool.cap {
+                stats.over = stats.over.saturating_add(1);
+            }
+            *slot = Some(pool.id);
+        }
+        Some(Grant {
+            ip,
+            source,
+            pools: counted,
+        })
     }
 
     /// Gives back what `grant` was granted: its slot, to the source it was
@@ -740,6 +852,14 @@ impl Addresses {
         // drift upwards and lock everyone out.
         debug_assert!(self.total_connections > 0);
         self.total_connections = self.total_connections.saturating_sub(1);
+        for id in grant.pools.iter().flatten() {
+            if let Some(stats) = self.pools.get_mut(id) {
+                debug_assert!(stats.connections > 0);
+                stats.connections = stats.connections.saturating_sub(1);
+            } else {
+                debug_assert!(false, "permit outlived its pool's record");
+            }
+        }
     }
 
     /// Says something about a limited address, at most once a second across the
@@ -784,6 +904,7 @@ impl Addresses {
 mod tests {
     use super::*;
     use crate::{ArcGoalkeeper, OwnedGoalkeeper};
+    use std::sync::Arc;
 
     /// An address, for a case that needs one.
     fn ip(n: u16) -> IpAddr {
@@ -1116,5 +1237,85 @@ mod tests {
         assert_eq!(seen(address), 1);
         drop(b);
         assert_eq!(seen(address), 0);
+    }
+
+    /// A pool, for a case that needs one.
+    const POOL: NonZeroU16 = NonZeroU16::new(7).unwrap();
+
+    /// Every address in [`POOL`] with `cap`, enforced or not.
+    fn all_in(gk: &OwnedGoalkeeper, cap: u32, enforce: bool) {
+        gk.set_pools(Some(Arc::new(move |_: IpAddr| {
+            Pools::new().with(Pool {
+                id: POOL,
+                cap,
+                enforce,
+            })
+        })));
+    }
+
+    #[test]
+    fn an_enforced_pool_refuses_at_its_cap() {
+        let gk = OwnedGoalkeeper::new();
+        all_in(&gk, 2, true);
+        // Each its own source, so only the pool is in the way.
+        let a = gk.connection_permit(ip(10), "test").unwrap();
+        let _b = gk.connection_permit(ip(11), "test").unwrap();
+        assert!(gk.connection_permit(ip(12), "test").is_none());
+        drop(a);
+        assert!(gk.connection_permit(ip(13), "test").is_some());
+    }
+
+    #[test]
+    fn an_unenforced_pool_counts_what_is_over() {
+        let gk = OwnedGoalkeeper::new();
+        all_in(&gk, 1, false);
+        let _a = gk.connection_permit(ip(10), "test").unwrap();
+        let _b = gk.connection_permit(ip(11), "test").unwrap();
+        let stats = gk.take_pool_stats();
+        assert_eq!(
+            stats,
+            vec![(
+                POOL,
+                PoolStats {
+                    connections: 2,
+                    peak: 2,
+                    over: 1,
+                }
+            )]
+        );
+        // Taken afresh: the peak is what it holds, and nothing is over.
+        assert_eq!(gk.take_pool_stats()[0].1.over, 0);
+    }
+
+    #[test]
+    fn only_the_addresses_in_a_pool_count_against_it() {
+        let gk = OwnedGoalkeeper::new();
+        let member = ip(20);
+        gk.set_pools(Some(Arc::new(move |address: IpAddr| {
+            if address == member {
+                Pools::new().with(Pool {
+                    id: POOL,
+                    cap: 1,
+                    enforce: true,
+                })
+            } else {
+                Pools::new()
+            }
+        })));
+        let _a = gk.connection_permit(member, "test").unwrap();
+        assert!(gk.connection_permit(member, "test").is_none());
+        assert!(gk.connection_permit(ip(21), "test").is_some());
+    }
+
+    #[test]
+    fn a_permit_gives_back_to_the_pools_it_was_counted_in() {
+        let gk = OwnedGoalkeeper::new();
+        all_in(&gk, 1, true);
+        let a = gk.connection_permit(ip(10), "test").unwrap();
+        gk.set_pools(None);
+        drop(a);
+        assert_eq!(gk.take_pool_stats()[0].1.connections, 0);
+        // Forgotten, once reported holding nothing.
+        assert!(gk.take_pool_stats().is_empty());
     }
 }
