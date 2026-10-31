@@ -276,7 +276,9 @@ pub(crate) fn lease<P: ProvideGoalkeeper>(
     }
 
     let outcome = conn.provider().limiter.with_process(|limiter, ledger, _| {
-        let over_ip = limiter.over_bandwidth(conn.ip(), dir);
+        // Re-evaluated at `now`, not just read: a refused source moves nothing
+        // to record, so only this lifts its mark once its allowance recovers.
+        let over_ip = limiter.over_bandwidth(conn.ip(), dir, now);
         let config = ledger.config;
         ledger.roll(conn.provider(), now, &config);
         let remaining = ledger.remaining(level, dir, &config);
@@ -320,7 +322,14 @@ pub(crate) fn lease<P: ProvideGoalkeeper>(
         // to what the peer sends. Being outranked on the uplink is goalkeeper's
         // own decision, and killing over it would disconnect a player for
         // traffic they never asked to be slowed.
+        //
+        // And only to the connection's own ration, not its address's. That is
+        // shared with the address's other connections, and can be spent in its
+        // name by anyone able to spoof it (see `Goalkeeper::record_address_bandwidth`),
+        // so killing over it would hand them a way to disconnect it. Held back
+        // is enough: it is not read, so it slows at the source.
         if dir == Direction::Rx
+            && !over_ip
             && let Some(after) = config.kill_after
         {
             let windows = windows_in(after, config.window);
@@ -382,6 +391,20 @@ pub(crate) fn paced_rate<P: ProvideGoalkeeper>(conn: &Conn<P>, dir: Direction) -
         u64::MAX
     };
     rate.max(MIN_PACED_RATE)
+}
+
+/// How fast `conn`'s address may move bytes in `dir`: zero while it is over
+/// its allowance, `None` for no limit.
+///
+/// For a connection the kernel paces, which never asks for a [`lease`] and
+/// so is never refused one. [`paced_rate`] is the level's ration, which is
+/// shared by every address at the level; this is the address's own, shared by
+/// its connections.
+pub(crate) fn address_rate<P: ProvideGoalkeeper>(conn: &Conn<P>, dir: Direction) -> Option<u64> {
+    let now = Instant::now();
+    conn.provider()
+        .limiter
+        .with(|limiter| limiter.bandwidth_rate(conn.ip(), dir, now))
 }
 
 /// The slowest a paced connection is ever held to: a segment per window at the

@@ -531,6 +531,16 @@ impl<P: ProvideGoalkeeper> Slot<P> {
         // `self` drops here, returning the slot however this resolved.
     }
 
+    /// Resolves when this handshake is evicted or displaced, for one that
+    /// [`Self::run`] cannot hold because it is not one future: a TLS
+    /// handshake that the connection it opens finishes, for instance.
+    ///
+    /// The slot is still given up by dropping it, as soon as the handshake is
+    /// over. Not to be awaited again once it has resolved.
+    pub(crate) async fn evicted(&mut self) {
+        let _ = (&mut self.kill).await;
+    }
+
     /// A handle for the handshake [`Self::run`] runs to say its peer's
     /// ClientHello has arrived, which it alone can see.
     ///

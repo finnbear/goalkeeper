@@ -108,6 +108,42 @@ impl RateLimiterState {
 
         !ok
     }
+
+    /// Adds `usage` to what is owed at `now`, after
+    /// [`Self::should_limit_rate_with_now_and_usage`] refused it.
+    ///
+    /// For a cost that has already been incurred, such as bytes that have
+    /// moved, rather than an action that could be turned away: refused or not,
+    /// it is paid back at the steady rate like any other, so the limit does not
+    /// lift while it keeps being incurred.
+    ///
+    /// Up to a burst's worth ahead of `now` and no further, so the limit lifts
+    /// within that once it stops. Without a ceiling, how long it stayed would
+    /// grow with everything ever incurred, and whoever can incur it in
+    /// another's name (a spoofed source, say) could hold the limit on them for
+    /// as long as they liked after stopping. Never shortens what is owed.
+    #[inline]
+    pub(crate) fn owe(&mut self, props: &RateLimiterProps, now: Instant, usage: Units) {
+        let Some(owed) = self
+            .until
+            .checked_add(props.rate_limit.saturating_mul(usage))
+        else {
+            return;
+        };
+        let ceiling = now
+            .checked_add(props.rate_limit.saturating_mul(props.burst))
+            .map_or(owed, |ceiling| ceiling.max(self.until));
+        self.until = owed.min(ceiling);
+    }
+
+    /// Whether what has been spent is still being paid back at the steady
+    /// rate at `now`; once it is not, the limit is effectively brand new (see
+    /// `until`). Spends nothing, for a caller that only needs to know whether
+    /// a limit it hit earlier has lifted.
+    #[inline]
+    pub(crate) fn in_debt(&self, now: Instant) -> bool {
+        now <= self.until
+    }
 }
 
 impl Default for RateLimiterState {

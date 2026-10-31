@@ -222,6 +222,18 @@ fn estimate(sketch: u64) -> u32 {
     (-BITS * (f64::from(zeros) / BITS).ln()).round() as u32
 }
 
+/// The bytes a second at which a source's allowance is no limit; see
+/// [`scaled`].
+const NO_LIMIT: Units = 1_000_000_000;
+
+/// The steady rate of [`scaled`]'s allowance in bytes a second, or `None`
+/// for no limit.
+fn steady_rate(config: &Config, actives: u32) -> Option<u64> {
+    let factor = 1 + actives.saturating_mul(config.per_active_session);
+    let per_second = config.bytes_per_second.saturating_mul(factor);
+    (per_second < NO_LIMIT).then_some(u64::from(per_second))
+}
+
 /// A source's allowance, widened by how many sessions it has proved it
 /// carries.
 fn scaled(config: &Config, actives: u32) -> RateLimiterProps {
@@ -231,7 +243,7 @@ fn scaled(config: &Config, actives: u32) -> RateLimiterProps {
     // nothing past a billion a second. Scaling a generous configured limit by a
     // source's active sessions reaches that easily, and no limit is what it
     // means, so it is said rather than derived.
-    if per_second >= 1_000_000_000 {
+    if per_second >= NO_LIMIT {
         return RateLimiterProps::no_limit();
     }
     RateLimiterProps::new_throughput(
@@ -651,21 +663,61 @@ impl Addresses {
         // Both directions are measured against the same allowance, which keeps
         // the configuration to one pair.
         let props = scaled(&config, actives);
-        let over =
-            entry.bandwidth[dir as usize].should_limit_rate_with_now_and_usage(&props, now, bytes);
-        entry.over_bandwidth[dir as usize] = over;
+        let limit = &mut entry.bandwidth[dir as usize];
+        let over = limit.should_limit_rate_with_now_and_usage(&props, now, bytes);
         if over {
+            // Moved regardless, so owed regardless. Otherwise a source that
+            // keeps sending while over has its mark lift as if it had
+            // stopped. Owed up to a burst ahead, and no more: this is public,
+            // and for UDP its sources can be spoofed.
+            limit.owe(&props, now, bytes);
             entry.last_limit = Some(now);
         }
+        entry.over_bandwidth[dir as usize] = over;
         self.maybe_prune(now);
     }
 
-    /// See [`IpLimiter::over_bandwidth`].
-    pub(crate) fn over_bandwidth(&self, ip: IpAddr, dir: Direction) -> bool {
-        self.usage
+    /// Whether `ip` is over its allowance in `dir` at `now`.
+    ///
+    /// [`Self::record_bandwidth`] marks a source over as its bytes move, but a
+    /// source over its allowance is refused leases (see `bandwidth::lease`),
+    /// so it moves none and nothing records it again. The mark lifts here
+    /// instead, once what it spent has been paid back at the steady rate.
+    /// Otherwise one overdraft would refuse the source for as long as it kept
+    /// trying: every connection stalled, new ones before their handshake.
+    pub(crate) fn over_bandwidth(&mut self, ip: IpAddr, dir: Direction, now: Instant) -> bool {
+        let source = self.source(ip);
+        let Some(entry) = self.usage.get_mut(&source) else {
+            return false;
+        };
+        let over = &mut entry.over_bandwidth[dir as usize];
+        if *over && !entry.bandwidth[dir as usize].in_debt(now) {
+            *over = false;
+        }
+        *over
+    }
+
+    /// How fast `ip` may move bytes in `dir` at `now`, for a caller that hands
+    /// the rate to something that paces itself and so never asks for a lease.
+    ///
+    /// `Some(0)` while it is over its allowance (see [`Self::over_bandwidth`]),
+    /// otherwise its steady rate in bytes a second, or `None` for no limit.
+    /// The steady rate, not the burst: pacing spreads bytes evenly, so it has
+    /// no use for one.
+    pub(crate) fn bandwidth_rate(
+        &mut self,
+        ip: IpAddr,
+        dir: Direction,
+        now: Instant,
+    ) -> Option<u64> {
+        if self.over_bandwidth(ip, dir, now) {
+            return Some(0);
+        }
+        let actives = self
+            .usage
             .get(&self.source(ip))
-            .map(|entry| entry.over_bandwidth[dir as usize])
-            .unwrap_or(false)
+            .map_or(0, |entry| entry.active_sessions);
+        steady_rate(&self.config, actives)
     }
 
     /// The record of `source`, an address already masked to its source.
@@ -1223,6 +1275,69 @@ mod tests {
         let gk = OwnedGoalkeeper::new();
         assert!(!gk.address_over_bandwidth(ip(3), Direction::Tx));
         assert!(!gk.address_over_bandwidth(ip(3), Direction::Rx));
+    }
+
+    /// A source over its allowance is refused leases, so it moves nothing and
+    /// nothing records it again: its mark must lift with time alone, once what
+    /// it spent is paid back, or one overdraft stalls it for as long as it
+    /// keeps trying (seen on a game server: every download from one address
+    /// stopped, new connections before their TLS handshake, until a restart).
+    #[test]
+    fn an_overdraft_lifts_with_no_further_traffic() {
+        let mut limiter = Addresses::default();
+        limiter.set_bandwidth_limits(1_000_000, 1_000_000);
+        let address = ip(6);
+        let start = Instant::now();
+        let after = |millis| start + std::time::Duration::from_millis(millis);
+        // 3MB at once against 1MB/s and a 1MB burst: the fourth 300KB spend
+        // finds the burst used up, with 0.9s of the steady rate owed. The
+        // bytes moved anyway, so the other seven spends are owed too, up to a
+        // burst's worth ahead: 1s.
+        for _ in 0..10 {
+            limiter.record_bandwidth(address, Direction::Tx, 300_000, start);
+        }
+        assert!(
+            limiter.over_bandwidth(address, Direction::Tx, start),
+            "over while paying back"
+        );
+        assert!(
+            limiter.over_bandwidth(address, Direction::Tx, after(950)),
+            "the bytes moved while over were let off"
+        );
+        // No bytes recorded since: only time has passed.
+        assert!(
+            !limiter.over_bandwidth(address, Direction::Tx, after(2_000)),
+            "paid back with nothing moving, so no longer over"
+        );
+        // And it stays lifted until it is overdrawn again.
+        assert!(!limiter.over_bandwidth(address, Direction::Tx, after(3_000)));
+    }
+
+    /// However much is recorded while over, the mark lifts within a burst's
+    /// worth of the steady rate once it stops. Recording is public, and for
+    /// UDP the source may be spoofed: a flood in a victim's name must not
+    /// lock the victim out for as long as the flood was large.
+    #[test]
+    fn an_overdraft_is_owed_up_to_a_burst() {
+        let mut limiter = Addresses::default();
+        // 2s to repay a burst.
+        limiter.set_bandwidth_limits(500_000, 1_000_000);
+        let address = ip(7);
+        let start = Instant::now();
+        let after = |millis| start + std::time::Duration::from_millis(millis);
+        // 1GB over 10s, which at the steady rate would take over half an hour
+        // to repay.
+        for i in 0..1_000 {
+            limiter.record_bandwidth(address, Direction::Rx, 1_000_000, after(i * 10));
+        }
+        assert!(
+            limiter.over_bandwidth(address, Direction::Rx, after(10_000)),
+            "the flood lifted while it lasted"
+        );
+        assert!(
+            !limiter.over_bandwidth(address, Direction::Rx, after(13_000)),
+            "still over long after the flood stopped"
+        );
     }
 
     #[test]

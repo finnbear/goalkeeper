@@ -13,9 +13,10 @@ DoS and DDoS protection library.
 - [x] Bandwidth limits/priorities
 - [x] CPU limits/priorities
 - [x] RAM limits/priorities
-- [x] TLS handshake timeouts and concurrency limits
+- [x] TLS handshake timeouts, concurrency limits, and 1/2 RTT
 - [x] TCP timeouts, pacing, delaying, and buffer limits/priorities
 - [x] HTTP timeouts and concurrency limits
+- [x] Attribution per IP subnet as opposed to per IP address
 - [x] Logging (`log`)
 - [x] Metrics
 - [ ] `nftables` firewall configuration
@@ -28,7 +29,7 @@ DoS and DDoS protection library.
 - [x] TLS for all of the above (`rustls`)
 
 ## Limitations
-- Not optimized for multi-core runtimes
+- Not optimized for multi-core processors
 - ~15% max throughput reduction
 
 ## Status

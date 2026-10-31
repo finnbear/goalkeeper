@@ -544,6 +544,65 @@ impl Applied {
         };
         applied.abs_diff(target) > applied / 8
     }
+
+    /// Readies `stream` to write, returning whether the kernel is pacing it.
+    ///
+    /// The uplink, rationed the same way the downlink is, since egress is
+    /// usually the scarcer direction.
+    ///
+    /// Once per window, hand the rate to the kernel, which spaces the packets
+    /// out itself rather than sending a window's worth and stopping. While it
+    /// does, a write is neither parked nor truncated; a short write would only
+    /// fragment it.
+    ///
+    /// Nagle goes with it: a connection keeping up wants its writes out now,
+    /// but one held to a low rate is better off coalescing them.
+    ///
+    /// The address's allowance holds it too, since a paced write never asks
+    /// for the lease that would otherwise enforce it. No faster than the
+    /// address's steady rate, so one connection cannot outrun it, and while the
+    /// address is over, not paced at all: leased instead, which parks it until
+    /// the allowance recovers. Each connection gets the whole rate, so several
+    /// together spend the burst and run on until the next window sees the
+    /// address over. Then all of them wait out what is owed, at most a burst's
+    /// worth, and resume together: on and off, averaging the allowance, as
+    /// the leased path does for an address over it.
+    fn configure_tx<P: ProvideGoalkeeper>(&mut self, stream: &TcpStream, conn: &Conn<P>) -> bool {
+        let index = Direction::Tx as usize;
+        let epoch = bandwidth::epoch_of(conn.provider());
+        if self.epoch[index] != Some(epoch) {
+            self.epoch[index] = Some(epoch);
+            let address = bandwidth::address_rate(conn, Direction::Tx);
+            let nodelay = if address == Some(0) {
+                // Leased instead, and as held back as a connection gets, so
+                // coalescing too.
+                self.kernel[index] = false;
+                false
+            } else {
+                let rate =
+                    bandwidth::paced_rate(conn, Direction::Tx).min(address.unwrap_or(u64::MAX));
+                // Only when it has actually moved. A settled connection
+                // computes the same rate every window and the kernel is already
+                // holding it, unless a window over its allowance stood the
+                // kernel down.
+                self.kernel[index] = if Self::worth_applying(self.rate, rate) {
+                    let set = crate::tokio_net::pace(stream, rate);
+                    if set {
+                        self.rate = Some(rate);
+                    }
+                    set
+                } else {
+                    true
+                };
+                rate > bandwidth::MIN_PACED_RATE
+            };
+            if self.nodelay != Some(nodelay) {
+                crate::tokio_net::set_nodelay(stream, nodelay);
+                self.nodelay = Some(nodelay);
+            }
+        }
+        self.kernel[index]
+    }
 }
 
 impl<P: ProvideGoalkeeper> ConnIo<P> {
@@ -619,11 +678,22 @@ impl<P: ProvideGoalkeeper> AsyncRead for ConnIo<P> {
                     read
                 }
             };
+            // The address's allowance bounds it too, as it does pacing (see
+            // `Applied::configure_tx`): a clamped read never asks the lease
+            // that would otherwise enforce it. While the address is over, the
+            // gate below rations instead, which refuses it, so an upload is
+            // slowed at the source rather than run on into debt that its
+            // address's next connection could not handshake through.
+            let address = bandwidth::address_rate(this.conn, Direction::Rx);
             this.applied.kernel[index] = match rtt {
+                _ if address == Some(0) => false,
                 Some(rtt) => {
-                    let ration = bandwidth::ration(this.conn, Direction::Rx);
-                    let flight =
-                        bandwidth::flight(ration, bandwidth::window_of(this.conn.provider()), rtt);
+                    let window = bandwidth::window_of(this.conn.provider());
+                    let ration = bandwidth::ration(this.conn, Direction::Rx).min(
+                        address
+                            .map_or(u64::MAX, |rate| (rate as f64 * window.as_secs_f64()) as u64),
+                    );
+                    let flight = bandwidth::flight(ration, window, rtt);
                     let room = crate::resource::memory::window_ceiling(this.conn);
                     let clamp = crate::resource::memory::quantise(flight.min(room))
                         .clamp(MIN_CLAMP, MAX_CLAMP) as u32;
@@ -679,38 +749,7 @@ impl<P: ProvideGoalkeeper> AsyncWrite for ConnIo<P> {
     ) -> Poll<io::Result<usize>> {
         let this = self.project();
 
-        // The uplink, rationed the same way the downlink is, since egress is
-        // usually the scarcer direction.
-        //
-        // Once per window, hand the rate to the kernel, which spaces the
-        // packets out itself rather than sending a window's worth and stopping.
-        //
-        // Nagle goes with it: a connection keeping up wants its writes out now,
-        // but one held to a low rate is better off coalescing them.
-        let index = Direction::Tx as usize;
-        let epoch = bandwidth::epoch_of(this.conn.provider());
-        if this.applied.epoch[index] != Some(epoch) {
-            let rate = bandwidth::paced_rate(this.conn, Direction::Tx);
-            // Only when it has actually moved; see `Applied`. A settled
-            // connection computes the same rate every window and the kernel is
-            // already holding it.
-            if Applied::worth_applying(this.applied.rate, rate) {
-                let set = crate::tokio_net::pace(&this.stream, rate);
-                if set {
-                    this.applied.rate = Some(rate);
-                }
-                this.applied.kernel[index] = set;
-            }
-            this.applied.epoch[index] = Some(epoch);
-
-            let nodelay = rate > bandwidth::MIN_PACED_RATE;
-            if this.applied.nodelay != Some(nodelay) {
-                crate::tokio_net::set_nodelay(&this.stream, nodelay);
-                this.applied.nodelay = Some(nodelay);
-            }
-        }
-
-        if this.applied.kernel[index] {
+        if this.applied.configure_tx(&this.stream, this.conn) {
             // Paced by the kernel, so the write is neither parked nor
             // truncated; a short write here would only fragment it.
             let polled = this.stream.poll_write(cx, buf);
@@ -752,6 +791,19 @@ impl<P: ProvideGoalkeeper> AsyncWrite for ConnIo<P> {
         bufs: &[io::IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
         let this = self.project();
+
+        // The same as `poll_write`, and not merely for symmetry: TLS writes
+        // every record through here, so a connection under `tokio-rustls` would
+        // otherwise never be paced, never have its Nagle setting follow its
+        // rate, and be parked and truncated even with the kernel pacing it.
+        if this.applied.configure_tx(&this.stream, this.conn) {
+            let polled = this.stream.poll_write_vectored(cx, bufs);
+            if let Poll::Ready(Ok(written)) = &polled {
+                this.conn.record(Direction::Tx, *written as u64);
+            }
+            return polled;
+        }
+
         if this.conn.throttled(Direction::Tx, cx) {
             return Poll::Pending;
         }
@@ -1007,6 +1059,168 @@ mod tests {
         let (tx, rx) = conn.bytes();
         assert_eq!(rx, 5);
         assert_eq!(tx, 8);
+    }
+
+    /// A paced connection answers to its address's allowance, which it never
+    /// asks a lease of: paced no faster than the address's steady rate, and
+    /// while the address is over, not paced but leased, and so parked.
+    ///
+    /// Linux, where the kernel paces at all.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn pacing_answers_to_the_address() {
+        let (gk, conn, killed) = conn();
+        gk.set_address_bandwidth_limits(50_000, 50_000);
+        let (_client, server) = socket_pair().await;
+        let mut io = ConnIo::new(server, conn.clone(), killed);
+        let tx = Direction::Tx as usize;
+
+        io.write_all(b"x").await.unwrap();
+        assert!(io.applied.kernel[tx], "not paced to begin with");
+        assert_eq!(
+            io.applied.rate,
+            Some(50_000),
+            "paced at the level's rate, past the address's"
+        );
+        // Above the floor, so keeping up and wanting its writes out now.
+        assert_eq!(io.applied.nodelay, Some(true));
+
+        // Overdrawn, as if by the address's other connections: the first
+        // spend is taken whole, and marks it over only once it is followed.
+        gk.limiter.with(|limiter| {
+            for _ in 0..2 {
+                limiter.record_bandwidth(
+                    conn.ip(),
+                    Direction::Tx,
+                    1_000_000,
+                    std::time::Instant::now(),
+                );
+            }
+        });
+        // The next window.
+        io.applied.epoch[tx] = None;
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        assert!(
+            Pin::new(&mut io).poll_write(&mut cx, b"x").is_pending(),
+            "wrote with the address over its allowance"
+        );
+        assert!(!io.applied.kernel[tx]);
+        assert_eq!(
+            io.applied.nodelay,
+            Some(false),
+            "held back, yet still not coalescing"
+        );
+    }
+
+    /// Refused because its address is over, a connection is held back and no
+    /// more. The allowance is the address's, not the connection's, and can be
+    /// spent in its name by others (spoofed UDP, through
+    /// `record_address_bandwidth`), so killing over it would let anyone who
+    /// could do that disconnect it.
+    #[tokio::test]
+    async fn an_address_over_its_allowance_is_held_back_not_killed() {
+        let (gk, conn, mut killed) = conn();
+        gk.set_bandwidth_window(std::time::Duration::from_millis(20));
+        gk.set_bandwidth_kill_after(Some(std::time::Duration::from_millis(60)));
+        gk.set_address_bandwidth_limits(50_000, 50_000);
+        gk.limiter.with(|limiter| {
+            for _ in 0..2 {
+                limiter.record_bandwidth(
+                    conn.ip(),
+                    Direction::Rx,
+                    1_000_000,
+                    std::time::Instant::now(),
+                );
+            }
+        });
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        // Ten windows, well past the three `kill_after` allows.
+        for _ in 0..10 {
+            assert!(
+                bandwidth::lease(&conn, Direction::Rx, &mut cx).is_none(),
+                "leased with the address over its allowance"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(killed.try_recv().is_err(), "killed for its address");
+    }
+
+    /// A clamped read answers to its address's allowance just as a paced write
+    /// does: while the address is over, the read is gated, and so refused.
+    ///
+    /// Linux, where the kernel clamps at all.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn clamping_answers_to_the_address() {
+        let (gk, conn, killed) = conn();
+        gk.set_address_bandwidth_limits(50_000, 50_000);
+        let (mut client, server) = socket_pair().await;
+        let mut io = ConnIo::new(server, conn.clone(), killed);
+        let rx = Direction::Rx as usize;
+
+        client.write_all(b"x").await.unwrap();
+        let mut byte = [0; 1];
+        io.read_exact(&mut byte).await.unwrap();
+        assert!(io.applied.kernel[rx], "not clamped to begin with");
+
+        // Overdrawn, as if by an upload on the address's other connections.
+        gk.limiter.with(|limiter| {
+            for _ in 0..2 {
+                limiter.record_bandwidth(
+                    conn.ip(),
+                    Direction::Rx,
+                    1_000_000,
+                    std::time::Instant::now(),
+                );
+            }
+        });
+        client.write_all(b"x").await.unwrap();
+        // The next window.
+        io.applied.epoch[rx] = None;
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        let mut buf = ReadBuf::new(&mut byte);
+        assert!(
+            Pin::new(&mut io).poll_read(&mut cx, &mut buf).is_pending(),
+            "read with the address over its allowance"
+        );
+        assert!(!io.applied.kernel[rx]);
+    }
+
+    /// A vectored write readies the socket exactly as a plain one does.
+    ///
+    /// TLS writes nothing else: rustls hands every record down as a vectored
+    /// write, so a connection under TLS that skipped this was never paced and
+    /// kept whatever Nagle setting it was accepted with.
+    #[tokio::test]
+    async fn a_vectored_write_configures_the_socket() {
+        // A plain write on a connection of its own, for comparison.
+        let (_plain_gk, plain_conn, plain_killed) = conn();
+        let (_plain_client, plain_server) = socket_pair().await;
+        let mut plain = ConnIo::new(plain_server, plain_conn, plain_killed);
+
+        let (mut client, server) = socket_pair().await;
+        let (_gk, conn, killed) = conn();
+        let mut io = ConnIo::new(server, conn.clone(), killed);
+
+        let written = io
+            .write_vectored(&[io::IoSlice::new(b"good"), io::IoSlice::new(b"bye!")])
+            .await
+            .unwrap();
+        plain.write_all(b"goodbye!").await.unwrap();
+
+        let tx = Direction::Tx as usize;
+        assert!(
+            io.applied.epoch[tx].is_some(),
+            "the window was never configured"
+        );
+        assert_eq!(io.applied.nodelay, plain.applied.nodelay);
+        assert_eq!(io.applied.kernel[tx], plain.applied.kernel[tx]);
+        assert_eq!(io.applied.rate, plain.applied.rate);
+
+        let mut buf = vec![0; written];
+        client.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf[..], &b"goodbye!"[..written]);
+        assert_eq!(conn.bytes().0, written as u64, "the write was not counted");
     }
 
     #[tokio::test]

@@ -18,6 +18,8 @@
 
 #[cfg(feature = "tls")]
 pub mod tls;
+#[cfg(feature = "tls")]
+mod tls_stream;
 #[cfg(feature = "web_socket")]
 pub mod web_socket;
 
@@ -26,6 +28,8 @@ use crate::conn::{Conn, ConnIo};
 #[cfg(feature = "tls")]
 use crate::resource::handshake;
 use crate::{ProvideGoalkeeper, SystemGoalkeeper};
+#[cfg(feature = "tls")]
+use tls_stream::TlsStream;
 
 use crate::executor::priority::{Priority, SharedPriority};
 use axum::Router;
@@ -60,43 +64,66 @@ const ACCEPT_BACKOFF_CEILING: Duration = Duration::from_secs(1);
 /// nothing gets HTTP/1.1. That would quietly cost the HTTP/2 limits below and
 /// the RFC 8441 WebSocket path with them.
 #[cfg(feature = "tls")]
-const ALPN: [&[u8]; 2] = [b"h2", b"http/1.1"];
+const ALPN: [&[u8]; 2] = [H2, b"http/1.1"];
 
-/// The caller's [`TlsConfig`][tls::TlsConfig] with [`ALPN`] applied, derived
-/// once per certificate.
+/// HTTP/2's ALPN identifier.
+#[cfg(feature = "tls")]
+const H2: &[u8] = b"h2";
+
+/// The caller's [`TlsConfig`][tls::TlsConfig] with [`ALPN`] applied and, when
+/// SETTINGS are sent early, half-RTT data allowed, derived once per
+/// certificate.
+///
+/// Half-RTT data is what lets HTTP/2's SETTINGS go out with the handshake; see
+/// [`tls_stream`]. Without early SETTINGS nothing needs it, so the caller's choice
+/// stands.
 ///
 /// The accept loop re-reads the configuration per connection so a renewed
-/// certificate is picked up at once, but applying the ALPN means cloning a
+/// certificate is picked up at once, but applying these means cloning a
 /// `rustls::ServerConfig`, which is not something to do per connection. The
 /// source is compared by pointer, so that clone happens only when the
 /// certificate actually changes, and not even then if the caller had already
 /// set what this would set.
 #[cfg(feature = "tls")]
-#[derive(Default)]
-struct Alpn(Option<(Arc<rustls::ServerConfig>, Arc<rustls::ServerConfig>)>);
+struct DerivedTlsConfig {
+    /// Whether to allow half-RTT data.
+    half_rtt: bool,
+    derived: Option<(Arc<rustls::ServerConfig>, Arc<rustls::ServerConfig>)>,
+}
 
 #[cfg(feature = "tls")]
-impl Alpn {
-    fn negotiating(&mut self, tls: &tls::TlsConfig) -> Arc<rustls::ServerConfig> {
+impl DerivedTlsConfig {
+    fn new(half_rtt: bool) -> Self {
+        Self {
+            half_rtt,
+            derived: None,
+        }
+    }
+
+    fn get(&mut self, tls: &tls::TlsConfig) -> Arc<rustls::ServerConfig> {
         let current = tls.current();
-        if let Some((source, negotiating)) = &self.0
+        if let Some((source, negotiating)) = &self.derived
             && Arc::ptr_eq(source, &current)
         {
             return Arc::clone(negotiating);
         }
-        let negotiating = if current
-            .alpn_protocols
-            .iter()
-            .map(Vec::as_slice)
-            .eq(ALPN.iter().copied())
+        let negotiating = if (!self.half_rtt || current.send_half_rtt_data)
+            && current
+                .alpn_protocols
+                .iter()
+                .map(Vec::as_slice)
+                .eq(ALPN.iter().copied())
         {
             Arc::clone(&current)
         } else {
             let mut config = current.as_ref().clone();
             config.alpn_protocols = ALPN.iter().map(|protocol| protocol.to_vec()).collect();
+            if self.half_rtt {
+                config.send_half_rtt_data = true;
+            }
             Arc::new(config)
         };
-        self.0 = Some((current, Arc::clone(&negotiating)));
+        self.derived = Some((current, Arc::clone(&negotiating)));
         negotiating
     }
 }
@@ -116,6 +143,8 @@ pub trait ServeHttp: ProvideGoalkeeper {
             router,
             #[cfg(feature = "tls")]
             tls: None,
+            #[cfg(feature = "tls")]
+            early_settings: true,
             hyper: None,
             label: "TCP connection",
         }
@@ -134,6 +163,7 @@ pub trait ServeHttp: ProvideGoalkeeper {
             listener,
             router,
             tls: Some(tls),
+            early_settings: true,
             hyper: None,
             label: "TLS connection",
         }
@@ -155,15 +185,52 @@ pub struct HttpServerBuilder<P: ProvideGoalkeeper = SystemGoalkeeper> {
     router: Router,
     #[cfg(feature = "tls")]
     tls: Option<crate::http::tls::TlsConfig>,
+    #[cfg(feature = "tls")]
+    early_settings: bool,
     hyper: Option<ConfigureHyper<P>>,
     label: &'static str,
 }
 
 impl<P: ProvideGoalkeeper> HttpServerBuilder<P> {
+    /// Whether an HTTPS listener sends HTTP/2's SETTINGS with the TLS
+    /// handshake, which it does by default.
+    ///
+    /// Every HTTPS connection is served before its handshake has completed.
+    /// On, one that negotiated `h2` is also served HTTP/2 from the start, so
+    /// hyper writes its SETTINGS before anything is read. On TLS 1.3 they then
+    /// leave in the same flight as the server's `Finished`, as half-RTT data. A
+    /// client that sends HTTP/1.1 regardless is refused.
+    ///
+    /// Off, hyper reads the client's preface to tell which protocol it speaks
+    /// before writing anything, so SETTINGS follow the client's `Finished`. A
+    /// client that waits for them, which every RFC 8441 WebSocket must, then
+    /// pays a round trip for it. For measuring that, or for a client that
+    /// cannot take them early.
+    ///
+    /// On also sets the [`rustls::ServerConfig`]'s `send_half_rtt_data`, for
+    /// every HTTPS connection: the caller's value cannot be told from rustls'
+    /// default, which is off. Only what hyper writes before it has read
+    /// anything goes out as half-RTT data, which is HTTP/2's SETTINGS alone,
+    /// and rustls never sends any to a configuration that authenticates
+    /// clients. To keep it off regardless, turn this off.
+    ///
+    /// No effect on plain HTTP, which has no handshake to send them with.
+    #[cfg(feature = "tls")]
+    pub fn early_settings(mut self, enabled: bool) -> Self {
+        self.early_settings = enabled;
+        self
+    }
+
     /// Adjusts hyper's connection builder.
     ///
     /// Goalkeeper sets the limits that are about denial of service; this is for
     /// everything else.
+    ///
+    /// Except which protocol a connection speaks, which is not the builder's
+    /// to say: hyper detects it, or over TLS, ALPN has chosen it. `http1_only`
+    /// and `http2_only` have no effect where hyper detects it, and the only
+    /// effect of `http1_only` otherwise is to keep an `h2` connection from
+    /// sending its SETTINGS early (see `early_settings`).
     pub fn configure_hyper<F>(mut self, configure: F) -> Self
     where
         F: Fn(&mut auto::Builder<PrioritisedExecutor<P>>) + Send + Sync + 'static,
@@ -195,12 +262,15 @@ impl<P: ProvideGoalkeeper> HttpServerBuilder<P> {
             router,
             #[cfg(feature = "tls")]
             tls,
+            #[cfg(feature = "tls")]
+            early_settings,
             hyper,
             label,
         } = self;
         let mut backoff = Duration::from_millis(1);
+        // Half-RTT data only when there is something to send in it.
         #[cfg(feature = "tls")]
-        let mut alpn = Alpn::default();
+        let mut derived_tls = DerivedTlsConfig::new(early_settings);
 
         loop {
             let accepted = tokio::select! {
@@ -262,7 +332,7 @@ impl<P: ProvideGoalkeeper> HttpServerBuilder<P> {
             #[cfg(feature = "tls")]
             let secure = match &tls {
                 Some(tls) => match provider.handshake_slot(conn.ip(), accepted_at, false) {
-                    Ok(slot) => Some((alpn.negotiating(tls), slot)),
+                    Ok(slot) => Some((derived_tls.get(tls), slot)),
                     Err(handshake::Refused) => {
                         let _ = stream.set_zero_linger();
                         continue;
@@ -290,10 +360,10 @@ impl<P: ProvideGoalkeeper> HttpServerBuilder<P> {
                     }
 
                     #[cfg(feature = "tls")]
-                    if let Some((tls_config, slot)) = secure {
-                        // Keepalive reaps only a dead peer, and hyper's header
-                        // read timeout starts once TLS is up, so without a slot
-                        // a peer that stalls mid-handshake holds a task
+                    if let Some((tls_config, mut slot)) = secure {
+                        // Keepalive reaps only a dead peer, and hyper's timeouts
+                        // are not written with a handshake in mind, so without a
+                        // slot a peer that stalls mid-handshake holds a task
                         // indefinitely.
                         let hello = slot.hello();
                         // In two halves, split at the ClientHello. A peer that
@@ -308,22 +378,45 @@ impl<P: ProvideGoalkeeper> HttpServerBuilder<P> {
                             )
                             .await?;
                             hello.heard();
-                            start.into_stream(tls_config).await
+                            let tokio_rustls::StartHandshake { accepted, io, .. } = start;
+                            TlsStream::start(accepted, io, tls_config).await
                         };
-                        #[allow(
-                            clippy::single_match,
-                            reason = "the empty arm is where the reasoning lives"
-                        )]
-                        match slot.run(accept).await {
-                            Some(Ok(stream)) => {
-                                let served = builder
-                                    .serve_connection_with_upgrades(TokioIo::new(stream), service);
-                                let _ = watcher.watch(served).await;
-                            }
-                            // Failed, abandoned and evicted handshakes are the
-                            // common case under attack; logging each one would
-                            // be the louder denial of service.
-                            Some(Err(_)) | None => {}
+                        // Failed, abandoned and evicted handshakes are the
+                        // common case under attack; logging each one would be
+                        // the louder denial of service.
+                        let (stream, handshaken) = tokio::select! {
+                            started = accept => match started {
+                                Ok(started) => started,
+                                Err(_) => return,
+                            },
+                            () = slot.evicted() => return,
+                        };
+                        // Served before the client's `Finished`, which the
+                        // connection's own reads then complete. See
+                        // `tls_stream`.
+                        let h2 = stream.session().alpn_protocol() == Some(H2);
+                        let io = TokioIo::new(stream);
+                        // Unless `configure_hyper` ruled HTTP/2 out, which hyper
+                        // detecting the protocol would ignore anyway.
+                        if early_settings && h2 && builder.is_http2_available() {
+                            // Without waiting to read which protocol the client
+                            // speaks, so hyper's SETTINGS are the first thing
+                            // it writes. Not with upgrades, which would wait
+                            // anyway: those are HTTP/1's, and RFC 8441's
+                            // WebSockets work without them.
+                            //
+                            // Only if not already said, since hyper-util
+                            // panics on being told twice.
+                            let builder = if builder.is_http1_available() {
+                                builder.http2_only()
+                            } else {
+                                builder
+                            };
+                            let served = builder.serve_connection(io, service);
+                            finish_handshake(watcher.watch(served), slot, handshaken).await;
+                        } else {
+                            let served = builder.serve_connection_with_upgrades(io, service);
+                            finish_handshake(watcher.watch(served), slot, handshaken).await;
                         }
                         return;
                     }
@@ -428,6 +521,30 @@ fn harden<P: ProvideGoalkeeper>(builder: &mut auto::Builder<PrioritisedExecutor<
         .max_send_buf_size(HTTP2_SEND_BUF)
         .max_local_error_reset_streams(256)
         .max_concurrent_streams(HTTP2_STREAMS);
+}
+
+/// Serves `connection` while it finishes its TLS handshake under `slot`, and
+/// then without it.
+///
+/// The slot covers the handshake and no further, as it would if the handshake
+/// were run under [`handshake::Slot::run`]; it cannot be here, since only the
+/// connection's own reads complete it.
+#[cfg(feature = "tls")]
+async fn finish_handshake<P: ProvideGoalkeeper, F: Future>(
+    connection: F,
+    mut slot: handshake::Slot<P>,
+    handshaken: tokio::sync::oneshot::Receiver<()>,
+) {
+    let mut connection = std::pin::pin!(connection);
+    tokio::select! {
+        _ = &mut connection => return,
+        // Or the stream was dropped, which leaves nothing to cover either.
+        _ = handshaken => {}
+        // Dropping the connection closes it.
+        () = slot.evicted() => return,
+    }
+    drop(slot);
+    connection.await;
 }
 
 /// A running HTTP server.

@@ -36,7 +36,7 @@ quinn = { version = "0.11.9", default-features = false, optional = true }
 [dev-dependencies]
 bytes = "1"
 http-body-util = "0.1"
-hyper = { version = "1.11", features = ["client", "http2"] }
+hyper = { version = "1.11", features = ["client", "http1", "http2"] }
 # The IO adapter and executor a `hyper` client needs. Already in the tree via
 # the `http` feature.
 hyper-util = { version = "0.1.20", features = ["tokio", "client"] }
@@ -79,6 +79,11 @@ required-features = ["http"]
 name = "http2"
 harness = false
 required-features = ["http"]
+
+[[bench]]
+name = "https_connect"
+harness = false
+required-features = ["tls"]
 
 [[bench]]
 name = "web_socket"
