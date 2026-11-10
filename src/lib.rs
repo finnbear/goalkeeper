@@ -285,9 +285,9 @@ impl Goalkeeper {
             .with(|limiter| limiter.record_bandwidth(ip, dir, bytes, now));
     }
 
-    /// Whether `ip` is currently over its allowance in `dir`: until what it
-    /// spent has been paid back at the steady rate, whether or not anything
-    /// has moved since.
+    /// Whether `ip` is currently over its allowance in `dir`: until enough of
+    /// what it spent has been paid back at the steady rate that it is back
+    /// within its burst, whether or not anything has moved since.
     pub fn address_over_bandwidth(&self, ip: IpAddr, dir: Direction) -> bool {
         let now = Instant::now();
         self.limiter

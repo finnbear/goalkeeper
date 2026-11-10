@@ -36,7 +36,7 @@
 
 use crate::ip_map::{Entry, IpMap};
 use crate::rate_limiter::{RateLimiterProps, RateLimiterState, Units};
-use crate::resource::bandwidth::Direction;
+use crate::resource::bandwidth::{Direction, MIN_PACED_RATE};
 use crate::{ProvideGoalkeeper, SystemGoalkeeper};
 use log::warn;
 use std::net::IpAddr;
@@ -234,6 +234,113 @@ fn steady_rate(config: &Config, actives: u32) -> Option<u64> {
     (per_second < NO_LIMIT).then_some(u64::from(per_second))
 }
 
+/// How many windows a source's paced connections are given to spend what is
+/// left of its burst in, at the least. More than one, so that the burst is
+/// never aimed at exactly: what is left halves each window, and a window that
+/// runs long, or bytes counted as they enter the socket's buffer rather than
+/// as they leave it, eat into the half that is not spent rather than putting
+/// the source over.
+const BURST_WINDOWS: f64 = 2.0;
+
+/// What a source's allowance holds each of its paced connections to; see
+/// [`Addresses::bandwidth_rate`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PacedShare {
+    /// The rate to pace at, which spends a [`BURST_WINDOWS`]th of what is left
+    /// of the burst a window. Zero while the source is over.
+    pub(crate) rate: u64,
+    /// The fastest a connection already paced may be left at, which spends all
+    /// of what is left in one window. A caller that leaves a rate alone until
+    /// it has moved enough to be worth a syscall must not leave it past this,
+    /// but may anywhere short of it.
+    pub(crate) ceiling: u64,
+}
+
+/// How many of a source's connections asked for their rate (see
+/// [`Addresses::bandwidth_rate`]) in the bandwidth window it was last asked in,
+/// and in the one before. A connection asks once a window, on its first write
+/// (or read) in it, so these are the connections moving bytes, not every one
+/// the source holds open: an idle keep-alive or a quiet game socket leaves
+/// more for the one that is busy.
+///
+/// And how much of the source's allowance this window has been handed out,
+/// so that however the count is off, the shares never add up to more.
+#[derive(Copy, Clone, Debug, Default)]
+struct Pacers {
+    /// The window, by its low bits: two that far apart are never compared.
+    epoch: u32,
+    this: u16,
+    last: u16,
+    /// The fraction of this window's allowance handed out so far.
+    claimed: f32,
+}
+
+impl Pacers {
+    /// Counts one more connection asking in `epoch`, of `open` the source
+    /// holds, returning the fraction of the source's allowance it may have.
+    ///
+    /// An equal share among as many as asked last window, since those that
+    /// will ask this window have not all asked yet when the first does. One
+    /// asking past that many is new to it, and the others like it may be
+    /// about to ask too, with nothing to say how many: an equal share among
+    /// all `open`, as cautious as can be, for a window. An equal share by
+    /// how many have asked would hand the k-th asker a k-th, and a browser
+    /// opening six at once over half again the whole between them.
+    ///
+    /// Whatever the share, no more than is left unclaimed this window, so
+    /// that between them they never overspend it.
+    fn ask(&mut self, epoch: u64, open: u32) -> f32 {
+        let epoch = epoch as u32;
+        if epoch != self.epoch {
+            self.last = if epoch == self.epoch.wrapping_add(1) {
+                self.this
+            } else {
+                0
+            };
+            self.this = 0;
+            self.claimed = 0.0;
+            self.epoch = epoch;
+        }
+        self.this = self.this.saturating_add(1);
+        let (this, last) = (u32::from(self.this), u32::from(self.last));
+        let ways = if this > last { this.max(open) } else { last };
+        let share = (1.0 / ways as f32).min(1.0 - self.claimed).max(0.0);
+        self.claimed += share;
+        share
+    }
+}
+
+/// The rate to pace one of a source's connections at, for one that has
+/// `headroom` of its burst left and whose rate is revisited every `window`:
+/// its `share` of the source's steady rate plus enough to spend a `windows`th
+/// of the headroom this window.
+///
+/// Pacing at the steady rate alone would never spend the burst, so a new
+/// visitor's first download (what the burst is for) would crawl at it however
+/// idle the host. With plenty of burst left this is far past anything a
+/// connection can do, so the download goes as fast as the link and the
+/// level's ration allow; only as the burst runs out does it bind, settling
+/// on the steady rate, which [`RateLimiterState::should_limit_spend`] lets a
+/// source keep up indefinitely. A transfer that outlasts the burst slows
+/// rather than stops.
+///
+/// Shared among the connections moving bytes (see [`Pacers`]), since each is
+/// paced on its own and all of them together must not spend past what is
+/// left. One that slows among them leaves its share unspent, which is paid
+/// back and so is in the headroom next window.
+///
+/// Never below [`MIN_PACED_RATE`], the floor the level's ration is held to
+/// as well, so a share is crawling but never stopped. Enough busy connections
+/// at it together overrun the steady rate (past forty at the defaults), and
+/// put the source over, which leases them instead.
+fn burst_rate(steady: u64, headroom: u64, share: f32, window: Duration, windows: f64) -> u64 {
+    // A window of nothing revisits the rate on every write; a millisecond is
+    // as good as nothing and does not divide by zero.
+    let window = window.max(Duration::from_millis(1)).as_secs_f64();
+    let rate = steady as f64 + headroom as f64 / (windows * window);
+    ((rate * f64::from(share)) as u64).max(MIN_PACED_RATE)
+}
+
 /// A source's allowance, widened by how many sessions it has proved it
 /// carries.
 fn scaled(config: &Config, actives: u32) -> RateLimiterProps {
@@ -274,7 +381,9 @@ pub struct IpStats {
     /// Roughly how many distinct addresses the source has asked to connect
     /// or held sessions from: exact for a few, saturating at about 266.
     pub addresses: u32,
-    /// When this source last hit a hard limit.
+    /// When this source last hit a hard limit on connecting. Not its
+    /// bandwidth allowance, whose sources can be spoofed; see
+    /// [`crate::Goalkeeper::address_over_bandwidth`] for that.
     pub last_limit: Option<Instant>,
 }
 
@@ -476,6 +585,9 @@ pub(crate) struct Usage {
     /// See [`IpStats::last_limit`].
     last_limit: Option<Instant>,
     over_bandwidth: [bool; 2],
+    /// Indexed by [`Direction`]: which of its connections are moving bytes,
+    /// to share its allowance among.
+    pacers: [Pacers; 2],
     /// The addresses seen, one bit each by hash; see [`estimate`].
     addresses: u64,
     /// The prefix its source was masked to for the bank its loans are
@@ -510,6 +622,7 @@ impl Usage {
             active_sessions: 0,
             last_limit: None,
             over_bandwidth: [false; 2],
+            pacers: Default::default(),
             addresses: 0,
             bank_prefix: 0,
         }
@@ -664,14 +777,20 @@ impl Addresses {
         // the configuration to one pair.
         let props = scaled(&config, actives);
         let limit = &mut entry.bandwidth[dir as usize];
-        let over = limit.should_limit_rate_with_now_and_usage(&props, now, bytes);
+        let over = limit.should_limit_spend(&props, now, bytes);
         if over {
             // Moved regardless, so owed regardless. Otherwise a source that
             // keeps sending while over has its mark lift as if it had
-            // stopped. Owed up to a burst ahead, and no more: this is public,
-            // and for UDP its sources can be spoofed.
+            // stopped. Owed up to a burst past where refusing starts, and no
+            // more: this is public, and for UDP its sources can be spoofed.
             limit.owe(&props, now, bytes);
-            entry.last_limit = Some(now);
+            // Not a limit hit, for `last_limit`'s purposes, which would hold
+            // the source to stricter terms of admission and bar it from
+            // borrowing for the DDoS memory. For the same reason: a flood in
+            // a spoofed source's name would hold its owner to them. And the
+            // sources most likely to overrun this together, a household or a
+            // school on one network loading a game's assets at once, are the
+            // ones borrowing is for. Held back, by being over, is enough.
         }
         entry.over_bandwidth[dir as usize] = over;
         self.maybe_prune(now);
@@ -682,16 +801,25 @@ impl Addresses {
     /// [`Self::record_bandwidth`] marks a source over as its bytes move, but a
     /// source over its allowance is refused leases (see `bandwidth::lease`),
     /// so it moves none and nothing records it again. The mark lifts here
-    /// instead, once what it spent has been paid back at the steady rate.
-    /// Otherwise one overdraft would refuse the source for as long as it kept
-    /// trying: every connection stalled, new ones before their handshake.
+    /// instead, once enough has been paid back that its next spend would be
+    /// accepted. Otherwise one overdraft would refuse the source for as long
+    /// as it kept trying: every connection stalled, new ones before their
+    /// handshake.
+    ///
+    /// Then, not once all of it has been paid back. That would hold every
+    /// connection of a source that overshot by a little for as long as its
+    /// whole burst takes to repay, which a burst sized for a game's assets
+    /// makes tens of seconds. Back within its burst, it may move bytes again,
+    /// and its paced connections pick up at its steady rate.
     pub(crate) fn over_bandwidth(&mut self, ip: IpAddr, dir: Direction, now: Instant) -> bool {
+        let config = self.config;
         let source = self.source(ip);
         let Some(entry) = self.usage.get_mut(&source) else {
             return false;
         };
+        let props = scaled(&config, entry.active_sessions);
         let over = &mut entry.over_bandwidth[dir as usize];
-        if *over && !entry.bandwidth[dir as usize].in_debt(now) {
+        if *over && !entry.bandwidth[dir as usize].would_limit_spend(&props, now) {
             *over = false;
         }
         *over
@@ -700,24 +828,50 @@ impl Addresses {
     /// How fast `ip` may move bytes in `dir` at `now`, for a caller that hands
     /// the rate to something that paces itself and so never asks for a lease.
     ///
-    /// `Some(0)` while it is over its allowance (see [`Self::over_bandwidth`]),
-    /// otherwise its steady rate in bytes a second, or `None` for no limit.
-    /// The steady rate, not the burst: pacing spreads bytes evenly, so it has
-    /// no use for one.
+    /// A rate of zero while it is over its allowance (see
+    /// [`Self::over_bandwidth`]), `None` for no limit, and otherwise rates in
+    /// bytes a second for each of its connections, by how much of its burst is
+    /// left (see [`burst_rate`]). `window` is how often the caller revisits
+    /// them, and `epoch` which window it is in.
+    ///
+    /// To be asked once a window per connection, and only by one moving bytes
+    /// in `dir`: each asking counts it among those the source's allowance is
+    /// shared by (see [`Pacers`]).
     pub(crate) fn bandwidth_rate(
         &mut self,
         ip: IpAddr,
         dir: Direction,
+        window: Duration,
+        epoch: u64,
         now: Instant,
-    ) -> Option<u64> {
+    ) -> Option<PacedShare> {
+        let source = self.source(ip);
+        // Counted even while over, so that the count is right once it is not.
+        // Never seen, so nothing else of it to share with: all of it.
+        let share = self.usage.get_mut(&source).map_or(1.0, |entry| {
+            let open = entry.connections;
+            entry.pacers[dir as usize].ask(epoch, open)
+        });
         if self.over_bandwidth(ip, dir, now) {
-            return Some(0);
+            return Some(PacedShare {
+                rate: 0,
+                ceiling: 0,
+            });
         }
-        let actives = self
-            .usage
-            .get(&self.source(ip))
-            .map_or(0, |entry| entry.active_sessions);
-        steady_rate(&self.config, actives)
+        let config = self.config;
+        let entry = self.usage.get(&source);
+        let actives = entry.map_or(0, |entry| entry.active_sessions);
+        let steady = steady_rate(&config, actives)?;
+        let props = scaled(&config, actives);
+        // Never recorded, so nothing spent: the whole burst.
+        let headroom = entry.map_or(props.burst(), |entry| {
+            entry.bandwidth[dir as usize].headroom(&props, now)
+        });
+        let rate = |windows| burst_rate(steady, u64::from(headroom), share, window, windows);
+        Some(PacedShare {
+            rate: rate(BURST_WINDOWS),
+            ceiling: rate(1.0),
+        })
     }
 
     /// The record of `source`, an address already masked to its source.
@@ -777,11 +931,7 @@ impl Addresses {
         const CONNECT_COST: Units = 10_000;
         usage.addresses |= sketch_bit(ip);
         let props = scaled(&config, usage.active_sessions);
-        if usage.bandwidth[Direction::Rx as usize].should_limit_rate_with_now_and_usage(
-            &props,
-            now,
-            CONNECT_COST,
-        ) {
+        if usage.bandwidth[Direction::Rx as usize].should_limit_spend(&props, now, CONNECT_COST) {
             usage.last_limit = Some(now);
             self.permits_withheld = self.permits_withheld.saturating_add(1);
             self.warn(ip, label, "connecting too fast", now);
@@ -941,11 +1091,24 @@ impl Addresses {
         self.prune(now);
     }
 
+    /// Forgets the sources there is nothing to remember about: none of their
+    /// connections or sessions open, nothing still owed, and no limit hit
+    /// within the [`Config::ddos_memory`].
+    ///
+    /// Not what was owed until some time ago, which every source that moved a
+    /// byte lately would satisfy, and which a spoofed flood could fill the
+    /// table with. What is still owed, since forgetting it would hand the
+    /// source a fresh allowance; and the limits it hit, since
+    /// [`Self::connection_permit`] holds a source that hit one within the
+    /// memory to stricter terms, which forgetting it would let it out of.
     fn prune(&mut self, now: Instant) {
-        let forget = now + self.config.ddos_memory;
+        let memory = self.config.ddos_memory;
         self.usage.retain(|_, usage| {
-            usage.bandwidth.iter().any(|state| state.until > forget)
-                || usage.custom.until > forget
+            usage.bandwidth.iter().any(|state| state.in_debt(now))
+                || usage.custom.in_debt(now)
+                || usage
+                    .last_limit
+                    .is_some_and(|last| now.saturating_duration_since(last) < memory)
                 || usage.active_sessions > 0
                 || usage.connections > 0
         })
@@ -1278,10 +1441,12 @@ mod tests {
     }
 
     /// A source over its allowance is refused leases, so it moves nothing and
-    /// nothing records it again: its mark must lift with time alone, once what
-    /// it spent is paid back, or one overdraft stalls it for as long as it
+    /// nothing records it again: its mark must lift with time alone, once it
+    /// is back within its burst, or one overdraft stalls it for as long as it
     /// keeps trying (seen on a game server: every download from one address
     /// stopped, new connections before their TLS handshake, until a restart).
+    /// Lifted then, not once all of it is paid back, so a source that
+    /// overshot by a little is stalled for a little.
     #[test]
     fn an_overdraft_lifts_with_no_further_traffic() {
         let mut limiter = Addresses::default();
@@ -1289,16 +1454,16 @@ mod tests {
         let address = ip(6);
         let start = Instant::now();
         let after = |millis| start + std::time::Duration::from_millis(millis);
-        // 3MB at once against 1MB/s and a 1MB burst: the fourth 300KB spend
-        // finds the burst used up, with 0.9s of the steady rate owed. The
-        // bytes moved anyway, so the other seven spends are owed too, up to a
-        // burst's worth ahead: 1s.
+        // 3MB at once against 1MB/s and a 1MB burst: the fifth 300KB spend
+        // finds 1.2MB owed, past the burst, and is refused. The bytes moved
+        // anyway, so it and the other five are owed too, up to two bursts'
+        // worth ahead: 2s owed, 1s of it past the burst.
         for _ in 0..10 {
             limiter.record_bandwidth(address, Direction::Tx, 300_000, start);
         }
         assert!(
             limiter.over_bandwidth(address, Direction::Tx, start),
-            "over while paying back"
+            "over while past the burst"
         );
         assert!(
             limiter.over_bandwidth(address, Direction::Tx, after(950)),
@@ -1306,11 +1471,292 @@ mod tests {
         );
         // No bytes recorded since: only time has passed.
         assert!(
-            !limiter.over_bandwidth(address, Direction::Tx, after(2_000)),
-            "paid back with nothing moving, so no longer over"
+            !limiter.over_bandwidth(address, Direction::Tx, after(1_050)),
+            "back within the burst with nothing moving, so no longer over"
         );
         // And it stays lifted until it is overdrawn again.
         assert!(!limiter.over_bandwidth(address, Direction::Tx, after(3_000)));
+    }
+
+    /// An eighth of a second, so that dividing by it is exact.
+    const WINDOW: Duration = Duration::from_millis(125);
+
+    /// A source's connections may together spend its steady rate and half of
+    /// what is left of its burst in a window, in equal shares; and be left at
+    /// up to all of what is left.
+    #[test]
+    fn a_paced_rate_spends_half_the_burst_a_window() {
+        let rate = |headroom, share| burst_rate(1_000_000, headroom, share, WINDOW, BURST_WINDOWS);
+        assert_eq!(
+            rate(8_000_000, 1.0),
+            33_000_000,
+            "4MB over a window: 32MB/s"
+        );
+        assert_eq!(rate(8_000_000, 0.25), 8_250_000, "a quarter of it");
+        assert_eq!(rate(0, 1.0), 1_000_000, "none of it: the steady rate");
+        assert_eq!(
+            burst_rate(1_000_000, 8_000_000, 1.0, WINDOW, 1.0),
+            65_000_000,
+            "the ceiling: 8MB over a window"
+        );
+    }
+
+    /// A new visitor's first download, which the burst is for, is not held
+    /// back by it; the burst refills as what was spent is paid back, not all
+    /// at once when all of it has been.
+    #[test]
+    fn a_source_is_paced_by_what_is_left_of_its_burst() {
+        let mut limiter = Addresses::default();
+        limiter.set_bandwidth_limits(1_000_000, 8_000_000);
+        let address = ip(7);
+        let start = Instant::now() + Duration::from_millis(10);
+        let after = |millis| start + Duration::from_millis(millis);
+        // One connection, asking in the window `now` falls in.
+        let rate = |limiter: &mut Addresses, now: Instant| {
+            let epoch = (now.duration_since(start).as_nanos() / WINDOW.as_nanos()) as u64;
+            limiter
+                .bandwidth_rate(address, Direction::Tx, WINDOW, epoch, now)
+                .map(|share| share.rate)
+        };
+        assert_eq!(rate(&mut limiter, start), Some(33_000_000), "never seen");
+        // 4MB at once owes 4s, leaving 4MB of the burst.
+        for _ in 0..4 {
+            limiter.record_bandwidth(address, Direction::Tx, 1_000_000, start);
+        }
+        assert_eq!(
+            rate(&mut limiter, start),
+            Some(17_000_000),
+            "half the burst left"
+        );
+        assert_eq!(
+            rate(&mut limiter, after(2_000)),
+            Some(25_000_000),
+            "half of what was spent paid back, so half of it is back"
+        );
+        assert_eq!(
+            rate(&mut limiter, after(4_100)),
+            Some(33_000_000),
+            "all paid back, so the whole burst again"
+        );
+    }
+
+    /// A transfer paced as [`Addresses::bandwidth_rate`] says, revisiting it
+    /// every window, spends the burst and settles on the steady rate without
+    /// ever going over, however long it outlasts the burst. The rate is
+    /// applied as `Applied::configure_tx` applies it, leaving it alone until
+    /// it moves an eighth unless that would overrun the ceiling, and once
+    /// settled, it is left alone.
+    #[test]
+    fn a_paced_transfer_settles_on_the_steady_rate_without_going_over() {
+        let mut limiter = Addresses::default();
+        limiter.set_bandwidth_limits(1_000_000, 8_000_000);
+        let address = ip(9);
+        let start = Instant::now() + Duration::from_millis(10);
+        // The link, which is all that holds the transfer back at first.
+        const LINK: u64 = 100_000_000;
+        let mut moved = 0u64;
+        let mut applied: Option<u64> = None;
+        let mut settled_syscalls = 0;
+        // A minute, in windows.
+        for window in 0..480u32 {
+            let now = start + WINDOW * window;
+            let share = limiter
+                .bandwidth_rate(address, Direction::Tx, WINDOW, window.into(), now)
+                .unwrap();
+            assert_ne!(share.rate, 0, "over in window {window}");
+            let apply = applied.is_none_or(|applied| {
+                applied.abs_diff(share.rate) > applied / 8 || applied > share.ceiling
+            });
+            if apply {
+                applied = Some(share.rate);
+                if window >= 240 {
+                    settled_syscalls += 1;
+                }
+            }
+            let rate = applied.unwrap();
+            let bytes = (rate.min(LINK) as f64 * WINDOW.as_secs_f64()) as u64;
+            // In sixteen writes over the window, as the kernel releases them.
+            for write in 0..16u32 {
+                let at = now + WINDOW * write / 16;
+                limiter.record_bandwidth(address, Direction::Tx, (bytes / 16) as u32, at);
+            }
+            moved += bytes;
+            if window == 0 {
+                assert_eq!(
+                    bytes, 4_125_000,
+                    "the first window: half the burst, and the steady rate"
+                );
+            }
+        }
+        // The burst and a minute at the steady rate: a little under, for what
+        // was left unspent of the burst, or a write over, since what is owed
+        // is weighed before a write rather than after it.
+        assert!(
+            (67_000_000..=68_100_000).contains(&moved),
+            "{moved}: the burst was not spent, or was overspent"
+        );
+        assert_eq!(
+            settled_syscalls, 0,
+            "the rate reapplied in the last half minute, long settled"
+        );
+    }
+
+    /// A source with nothing open is kept while it owes anything, so that it
+    /// does not get a fresh allowance, and for the memory after it was last
+    /// limited, so that it stays under stricter terms; and otherwise forgotten,
+    /// so that a flood of sources that merely moved a byte does not stay.
+    #[test]
+    fn a_source_is_remembered_while_it_owes_or_was_limited_lately() {
+        let mut limiter = Addresses::default();
+        limiter.set_bandwidth_limits(1_000_000, 1_000_000);
+        let limited = ip(10);
+        let seen = ip(11);
+        let overdrawn = ip(13);
+        let start = Instant::now() + Duration::from_millis(10);
+        let after = |millis| start + Duration::from_millis(millis);
+        let known = |limiter: &Addresses, ip| limiter.usage.get(&limiter.source(ip)).is_some();
+        // Refused a connection, which is what marks a source limited, and
+        // owing nothing.
+        let source = limiter.source(limited);
+        limiter.entry(source).last_limit = Some(start);
+        // A kilobyte, owing a millisecond.
+        limiter.record_bandwidth(seen, Direction::Tx, 1_000, start);
+        // Over: 3MB against a 1MB burst. The third finds 2MB owed, past the
+        // burst, so is refused and owed too, for 2s in all, two bursts'
+        // worth. Over its allowance, but not limited: that is for connecting.
+        for _ in 0..3 {
+            limiter.record_bandwidth(overdrawn, Direction::Tx, 1_000_000, start);
+        }
+        assert!(limiter.over_bandwidth(overdrawn, Direction::Tx, start));
+        assert_eq!(
+            limiter
+                .usage
+                .get(&limiter.source(overdrawn))
+                .unwrap()
+                .last_limit,
+            None,
+            "an overdraft marked the source limited"
+        );
+
+        limiter.prune(start);
+        assert!(
+            known(&limiter, limited) && known(&limiter, seen) && known(&limiter, overdrawn),
+            "limited, or still owing"
+        );
+
+        limiter.prune(after(10_000));
+        assert!(
+            known(&limiter, limited),
+            "limited within the memory, so remembered"
+        );
+        assert!(
+            !known(&limiter, seen),
+            "paid back and never limited, so forgotten"
+        );
+        assert!(
+            !known(&limiter, overdrawn),
+            "overdrawn, but paid back and never limited, so forgotten"
+        );
+
+        limiter.prune(after(5 * 60 * 1_000 + 1));
+        assert!(
+            !known(&limiter, limited),
+            "limited before the memory, so forgotten"
+        );
+    }
+
+    /// Past its burst, a source is over, and paced connections are stood down
+    /// as before.
+    #[test]
+    fn a_source_past_its_burst_is_not_paced() {
+        let mut limiter = Addresses::default();
+        limiter.set_bandwidth_limits(1_000_000, 8_000_000);
+        let address = ip(8);
+        let start = Instant::now() + Duration::from_millis(10);
+        for _ in 0..10 {
+            limiter.record_bandwidth(address, Direction::Tx, 1_000_000, start);
+        }
+        assert_eq!(
+            limiter
+                .bandwidth_rate(address, Direction::Tx, WINDOW, 0, start)
+                .map(|share| share.rate),
+            Some(0)
+        );
+    }
+
+    /// A source's allowance is shared among the connections moving bytes, not
+    /// all it holds open: as many as asked for their rate last window. One
+    /// left busy alone among idle ones gets all of it once the others have
+    /// been quiet for a whole window. One asking past last window's count is
+    /// given a share among all that are open, and only what is unclaimed.
+    #[test]
+    fn a_source_is_shared_among_its_busy_connections() {
+        // Ten open, most of them idle throughout.
+        const OPEN: u32 = 10;
+        let mut pacers = Pacers::default();
+        assert_eq!(pacers.ask(5, OPEN), 0.1, "nothing to go by: a tenth");
+        assert_eq!(pacers.ask(5, OPEN), 0.1, "nor for the second");
+        assert_eq!(pacers.ask(6, OPEN), 0.5, "two asked last window: halves");
+        assert_eq!(pacers.ask(7, OPEN), 1.0, "the second quiet for a window");
+        assert_eq!(
+            pacers.ask(7, OPEN),
+            0.0,
+            "a newcomer, with all of it claimed: nothing, for a window"
+        );
+        assert_eq!(pacers.ask(8, OPEN), 0.5, "then halves");
+        assert_eq!(pacers.ask(8, OPEN), 0.5);
+        assert_eq!(
+            pacers.ask(10, OPEN),
+            0.1,
+            "a window skipped: nothing to go by"
+        );
+    }
+
+    /// However many ask in a window, and however few are thought open, the
+    /// shares handed out never add up to more than the whole.
+    #[test]
+    fn shares_never_add_up_past_the_whole() {
+        for open in [0, 1, 3, 6, 100] {
+            let mut pacers = Pacers::default();
+            for epoch in [1, 2, 4] {
+                let total: f32 = (0..12).map(|_| pacers.ask(epoch, open)).sum();
+                assert!(total <= 1.0 + 1e-6, "{total} handed out, {open} open");
+            }
+        }
+    }
+
+    /// A browser opening six connections at once, at the defaults: between
+    /// them, the first window spends no more than is left of the burst.
+    #[test]
+    fn connections_starting_together_do_not_overspend_the_burst() {
+        let mut limiter = Addresses::default();
+        limiter.set_bandwidth_limits(500_000, 1_000_000);
+        let address = ip(14);
+        let start = Instant::now() + Duration::from_millis(10);
+        limiter.record_bandwidth(address, Direction::Tx, 1, start);
+        let source = limiter.source(address);
+        limiter.entry(source).connections = 6;
+        let total: u64 = (0..6)
+            .map(|_| {
+                limiter
+                    .bandwidth_rate(address, Direction::Tx, WINDOW, 3, start)
+                    .unwrap()
+                    .rate
+            })
+            .sum();
+        let spent = total as f64 * WINDOW.as_secs_f64();
+        // What is left, and what the window pays back.
+        let allowed = 1_000_000.0 + 500_000.0 * WINDOW.as_secs_f64();
+        assert!(spent <= allowed, "{spent} spent of {allowed}");
+    }
+
+    /// Shared however many ways, a connection is not paced below the floor.
+    #[test]
+    fn a_share_is_not_below_the_floor() {
+        assert_eq!(
+            burst_rate(500_000, 0, 0.001, WINDOW, BURST_WINDOWS),
+            MIN_PACED_RATE
+        );
     }
 
     /// However much is recorded while over, the mark lifts within a burst's
@@ -1326,7 +1772,8 @@ mod tests {
         let start = Instant::now();
         let after = |millis| start + std::time::Duration::from_millis(millis);
         // 1GB over 10s, which at the steady rate would take over half an hour
-        // to repay.
+        // to repay. Owed two bursts ahead throughout, so never back within
+        // one while it lasts, and back within one 2s after it stops.
         for i in 0..1_000 {
             limiter.record_bandwidth(address, Direction::Rx, 1_000_000, after(i * 10));
         }

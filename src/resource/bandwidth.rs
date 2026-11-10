@@ -21,6 +21,7 @@
 
 use crate::conn::Conn;
 use crate::executor::priority::Priority;
+use crate::resource::ip_limiter::PacedShare;
 use crate::{Goalkeeper, ProvideGoalkeeper};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -383,7 +384,16 @@ pub(crate) fn epoch_of(gk: &Goalkeeper) -> u64 {
 /// Zero is not usable: `SO_MAX_PACING_RATE` reads it as unpaced, which would
 /// release a throttled connection rather than restrain it.
 pub(crate) fn paced_rate<P: ProvideGoalkeeper>(conn: &Conn<P>, dir: Direction) -> u64 {
-    let window = window_of(conn.provider()).as_secs_f64();
+    paced_rate_in(conn, dir, window_of(conn.provider()))
+}
+
+/// [`paced_rate`], for a caller that already has the [`window`].
+pub(crate) fn paced_rate_in<P: ProvideGoalkeeper>(
+    conn: &Conn<P>,
+    dir: Direction,
+    window: Duration,
+) -> u64 {
+    let window = window.as_secs_f64();
     let remaining = ration(conn, dir);
     let rate = if window > 0.0 {
         (remaining as f64 / window) as u64
@@ -393,18 +403,30 @@ pub(crate) fn paced_rate<P: ProvideGoalkeeper>(conn: &Conn<P>, dir: Direction) -
     rate.max(MIN_PACED_RATE)
 }
 
-/// How fast `conn`'s address may move bytes in `dir`: zero while it is over
-/// its allowance, `None` for no limit.
+/// How fast `conn` may move bytes in `dir` by its address's allowance: a rate
+/// of zero while the address is over it, `None` for no limit, and otherwise
+/// this connection's share of what the address may spend this window, which
+/// is far past anything a connection can do while the address has plenty of
+/// burst left, and settles on its steady rate as that runs out.
 ///
 /// For a connection the kernel paces, which never asks for a [`lease`] and
 /// so is never refused one. [`paced_rate`] is the level's ration, which is
 /// shared by every address at the level; this is the address's own, shared by
-/// its connections.
-pub(crate) fn address_rate<P: ProvideGoalkeeper>(conn: &Conn<P>, dir: Direction) -> Option<u64> {
+/// its connections. A caller paces at the lesser.
+///
+/// Once a window (`epoch`, of length `window`) per connection, and only by
+/// one moving bytes in `dir`, since asking counts it among those sharing the
+/// address's allowance.
+pub(crate) fn address_rate<P: ProvideGoalkeeper>(
+    conn: &Conn<P>,
+    dir: Direction,
+    window: Duration,
+    epoch: u64,
+) -> Option<PacedShare> {
     let now = Instant::now();
     conn.provider()
         .limiter
-        .with(|limiter| limiter.bandwidth_rate(conn.ip(), dir, now))
+        .with(|limiter| limiter.bandwidth_rate(conn.ip(), dir, window, epoch, now))
 }
 
 /// The slowest a paced connection is ever held to: a segment per window at the

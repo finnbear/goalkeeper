@@ -109,19 +109,22 @@ impl RateLimiterState {
         !ok
     }
 
-    /// Adds `usage` to what is owed at `now`, after
-    /// [`Self::should_limit_rate_with_now_and_usage`] refused it.
+    /// Adds `usage` to what is owed at `now`, after [`Self::should_limit_spend`]
+    /// refused it.
     ///
     /// For a cost that has already been incurred, such as bytes that have
     /// moved, rather than an action that could be turned away: refused or not,
     /// it is paid back at the steady rate like any other, so the limit does not
     /// lift while it keeps being incurred.
     ///
-    /// Up to a burst's worth ahead of `now` and no further, so the limit lifts
-    /// within that once it stops. Without a ceiling, how long it stayed would
-    /// grow with everything ever incurred, and whoever can incur it in
-    /// another's name (a spoofed source, say) could hold the limit on them for
-    /// as long as they liked after stopping. Never shortens what is owed.
+    /// Up to two bursts' worth ahead of `now` and no further: a burst past
+    /// where [`Self::should_limit_spend`] starts refusing, so the limit lifts
+    /// within a burst's worth once it stops. Not one burst, which is where
+    /// refusing starts, and so would never add anything. Without a ceiling,
+    /// how long it stayed would grow with everything ever incurred, and
+    /// whoever can incur it in another's name (a spoofed source, say) could
+    /// hold the limit on them for as long as they liked after stopping. Never
+    /// shortens what is owed.
     #[inline]
     pub(crate) fn owe(&mut self, props: &RateLimiterProps, now: Instant, usage: Units) {
         let Some(owed) = self
@@ -131,7 +134,11 @@ impl RateLimiterState {
             return;
         };
         let ceiling = now
-            .checked_add(props.rate_limit.saturating_mul(props.burst))
+            .checked_add(
+                props
+                    .rate_limit
+                    .saturating_mul(props.burst.saturating_mul(2)),
+            )
             .map_or(owed, |ceiling| ceiling.max(self.until));
         self.until = owed.min(ceiling);
     }
@@ -143,6 +150,67 @@ impl RateLimiterState {
     #[inline]
     pub(crate) fn in_debt(&self, now: Instant) -> bool {
         now <= self.until
+    }
+
+    /// Like [`Self::should_limit_rate_with_now_and_usage`], but the burst
+    /// refills as what is owed is paid back, rather than all at once when all
+    /// of it has been: refused only while more than a burst's worth is owed.
+    /// Leaves `burst_used` alone; what is owed is all it reads.
+    ///
+    /// For bandwidth, where a source paced at its steady rate must be able to
+    /// keep that up indefinitely. Under the other, every unit spent while
+    /// anything is owed comes out of the burst, so a source that has spent
+    /// some of it and carries on at its steady rate, which never pays any of
+    /// it back, runs out and is refused regardless.
+    ///
+    /// Only what is owed before `usage` is weighed, so a single spend larger
+    /// than the burst is not refused for its size, as the other does not
+    /// refuse the first spend once nothing is owed.
+    #[inline]
+    pub(crate) fn should_limit_spend(
+        &mut self,
+        props: &RateLimiterProps,
+        now: Instant,
+        usage: Units,
+    ) -> bool {
+        if self.would_limit_spend(props, now) {
+            return true;
+        }
+        if let Some(until) = self
+            .until
+            .max(now)
+            .checked_add(props.rate_limit.saturating_mul(usage))
+        {
+            self.until = until;
+        }
+        false
+    }
+
+    /// Whether [`Self::should_limit_spend`] would refuse at `now`: more than a
+    /// burst's worth is owed. Spends nothing.
+    #[inline]
+    pub(crate) fn would_limit_spend(&self, props: &RateLimiterProps, now: Instant) -> bool {
+        props.rate_limit != Duration::ZERO && self.owed(props, now) > props.burst
+    }
+
+    /// How much is owed at `now`, in units: what is still to be paid back at
+    /// the steady rate.
+    #[inline]
+    fn owed(&self, props: &RateLimiterProps, now: Instant) -> Units {
+        let owed = self.until.saturating_duration_since(now).as_nanos();
+        let unit = props.rate_limit.as_nanos().max(1);
+        owed.div_ceil(unit).min(u128::from(Units::MAX)) as Units
+    }
+
+    /// How much more may be spent at `now` before
+    /// [`Self::should_limit_spend`] refuses: the burst, less what is owed.
+    /// Spends nothing.
+    #[inline]
+    pub(crate) fn headroom(&self, props: &RateLimiterProps, now: Instant) -> Units {
+        if props.rate_limit == Duration::ZERO {
+            return Units::MAX;
+        }
+        props.burst.saturating_sub(self.owed(props, now))
     }
 }
 

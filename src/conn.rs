@@ -559,33 +559,39 @@ impl Applied {
     /// but one held to a low rate is better off coalescing them.
     ///
     /// The address's allowance holds it too, since a paced write never asks
-    /// for the lease that would otherwise enforce it. No faster than the
-    /// address's steady rate, so one connection cannot outrun it, and while the
-    /// address is over, not paced at all: leased instead, which parks it until
-    /// the allowance recovers. Each connection gets the whole rate, so several
-    /// together spend the burst and run on until the next window sees the
-    /// address over. Then all of them wait out what is owed, at most a burst's
-    /// worth, and resume together: on and off, averaging the allowance, as
-    /// the leased path does for an address over it.
+    /// for the lease that would otherwise enforce it. While the address has
+    /// plenty of burst left, its share is far past the level's ration, so a
+    /// new visitor's first download goes as fast as the link and the ration
+    /// allow; as the burst runs out, its connections settle on their shares of
+    /// its steady rate rather than putting it over (see
+    /// `bandwidth::address_rate`). Should it go over regardless, not paced at
+    /// all: leased instead, which parks it until the allowance recovers.
     fn configure_tx<P: ProvideGoalkeeper>(&mut self, stream: &TcpStream, conn: &Conn<P>) -> bool {
         let index = Direction::Tx as usize;
         let epoch = bandwidth::epoch_of(conn.provider());
         if self.epoch[index] != Some(epoch) {
             self.epoch[index] = Some(epoch);
-            let address = bandwidth::address_rate(conn, Direction::Tx);
-            let nodelay = if address == Some(0) {
+            let window = bandwidth::window_of(conn.provider());
+            let fair = bandwidth::paced_rate_in(conn, Direction::Tx, window);
+            let address = bandwidth::address_rate(conn, Direction::Tx, window, epoch);
+            let nodelay = if address.is_some_and(|address| address.rate == 0) {
                 // Leased instead, and as held back as a connection gets, so
                 // coalescing too.
                 self.kernel[index] = false;
                 false
             } else {
-                let rate =
-                    bandwidth::paced_rate(conn, Direction::Tx).min(address.unwrap_or(u64::MAX));
+                let rate = fair.min(address.map_or(u64::MAX, |address| address.rate));
                 // Only when it has actually moved. A settled connection
                 // computes the same rate every window and the kernel is already
                 // holding it, unless a window over its allowance stood the
-                // kernel down.
-                self.kernel[index] = if Self::worth_applying(self.rate, rate) {
+                // kernel down. Except when what the kernel is holding would
+                // spend more of its address's burst this window than is left:
+                // that is a budget, and the eighth's leeway could overrun it
+                // every window.
+                let overrunning = address.is_some_and(|address| {
+                    self.rate.is_some_and(|applied| applied > address.ceiling)
+                });
+                self.kernel[index] = if overrunning || Self::worth_applying(self.rate, rate) {
                     let set = crate::tokio_net::pace(stream, rate);
                     if set {
                         self.rate = Some(rate);
@@ -684,11 +690,12 @@ impl<P: ProvideGoalkeeper> AsyncRead for ConnIo<P> {
             // gate below rations instead, which refuses it, so an upload is
             // slowed at the source rather than run on into debt that its
             // address's next connection could not handshake through.
-            let address = bandwidth::address_rate(this.conn, Direction::Rx);
+            let window = bandwidth::window_of(this.conn.provider());
+            let address = bandwidth::address_rate(this.conn, Direction::Rx, window, epoch)
+                .map(|address| address.rate);
             this.applied.kernel[index] = match rtt {
                 _ if address == Some(0) => false,
                 Some(rtt) => {
-                    let window = bandwidth::window_of(this.conn.provider());
                     let ration = bandwidth::ration(this.conn, Direction::Rx).min(
                         address
                             .map_or(u64::MAX, |rate| (rate as f64 * window.as_secs_f64()) as u64),
@@ -1062,8 +1069,10 @@ mod tests {
     }
 
     /// A paced connection answers to its address's allowance, which it never
-    /// asks a lease of: paced no faster than the address's steady rate, and
-    /// while the address is over, not paced but leased, and so parked.
+    /// asks a lease of: paced past the address's steady rate while it has its
+    /// burst to spend, but never so fast that a window would spend more than
+    /// half of what is left, and while the address is over, not paced but
+    /// leased, and so parked.
     ///
     /// Linux, where the kernel paces at all.
     #[cfg(target_os = "linux")]
@@ -1077,10 +1086,14 @@ mod tests {
 
         io.write_all(b"x").await.unwrap();
         assert!(io.applied.kernel[tx], "not paced to begin with");
-        assert_eq!(
-            io.applied.rate,
-            Some(50_000),
-            "paced at the level's rate, past the address's"
+        // The level's ration on an idle host is far past both, so the burst
+        // is what bounds it: 50KB/s, plus half the 50KB burst over a 100ms
+        // window.
+        let rate = io.applied.rate.expect("paced");
+        assert!(
+            rate > 50_000 && rate <= 300_000,
+            "{rate}: not paced past the steady rate with its burst whole, or \
+             paced past what a window could spend of it"
         );
         // Above the floor, so keeping up and wanting its writes out now.
         assert_eq!(io.applied.nodelay, Some(true));
