@@ -125,6 +125,43 @@ pub fn round_trip(stream: &TcpStream) -> Option<Duration> {
     }
 }
 
+/// Bytes written to this connection that the peer has not yet acknowledged,
+/// whether the kernel has sent them or not: what the kernel is still holding.
+///
+/// A paced connection tops the kernel up to its budget rather than adding to
+/// what it holds, so reads this once per window. `SIOCOUTQ`, which `libc`
+/// names `TIOCOUTQ` (the same request on Linux), is a single
+/// `ioctl`, with nothing copied out of the socket.
+///
+/// [`None`] on any platform but Linux, or if the read fails. A caller with no
+/// count should assume nothing is queued.
+#[allow(
+    unsafe_code,
+    reason = "`ioctl` has no safe wrapper in `std` or `socket2`"
+)]
+pub fn queued(stream: &TcpStream) -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        let mut bytes: libc::c_int = 0;
+        // SAFETY: a valid fd, and a destination for the `int` this request
+        // writes, which is what the kernel expects of it.
+        let read = unsafe {
+            libc::ioctl(
+                stream.as_raw_fd(),
+                libc::TIOCOUTQ,
+                std::ptr::from_mut(&mut bytes),
+            )
+        };
+        (read == 0).then(|| u64::try_from(bytes).unwrap_or(0))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = stream;
+        None
+    }
+}
+
 /// Turns Nagle's algorithm on or off for this connection.
 ///
 /// Worth modulating rather than setting once: nodelay while unthrottled, so

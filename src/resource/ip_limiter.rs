@@ -262,17 +262,12 @@ pub(crate) struct PacedShare {
 /// (or read) in it, so these are the connections moving bytes, not every one
 /// the source holds open: an idle keep-alive or a quiet game socket leaves
 /// more for the one that is busy.
-///
-/// And how much of the source's allowance this window has been handed out,
-/// so that however the count is off, the shares never add up to more.
 #[derive(Copy, Clone, Debug, Default)]
 struct Pacers {
     /// The window, by its low bits: two that far apart are never compared.
     epoch: u32,
     this: u16,
     last: u16,
-    /// The fraction of this window's allowance handed out so far.
-    claimed: f32,
 }
 
 impl Pacers {
@@ -287,8 +282,17 @@ impl Pacers {
     /// how many have asked would hand the k-th asker a k-th, and a browser
     /// opening six at once over half again the whole between them.
     ///
-    /// Whatever the share, no more than is left unclaimed this window, so
-    /// that between them they never overspend it.
+    /// Never nothing, even when those before it this window have between them
+    /// been handed the whole. A share is held for the window it is asked in
+    /// and often well past it: a connection that hands the kernel a large
+    /// response at once may not write, and so not ask again, for many windows
+    /// (see `Applied::configure_tx`). Shut out for the window it asked in, a
+    /// download would crawl at the floor long after the window had rolled.
+    /// The k-th to ask is given at most a k-th, so `n` askers' shares add up to
+    /// no more than `1 + ln n` (two shares and a half for a browser's six); and
+    /// what is actually spent past the allowance is owed (see
+    /// `RateLimiterState::headroom`), so the source slows for it in the
+    /// windows after.
     fn ask(&mut self, epoch: u64, open: u32) -> f32 {
         let epoch = epoch as u32;
         if epoch != self.epoch {
@@ -298,15 +302,12 @@ impl Pacers {
                 0
             };
             self.this = 0;
-            self.claimed = 0.0;
             self.epoch = epoch;
         }
         self.this = self.this.saturating_add(1);
         let (this, last) = (u32::from(self.this), u32::from(self.last));
         let ways = if this > last { this.max(open) } else { last };
-        let share = (1.0 / ways as f32).min(1.0 - self.claimed).max(0.0);
-        self.claimed += share;
-        share
+        1.0 / ways as f32
     }
 }
 
@@ -1688,7 +1689,7 @@ mod tests {
     /// all it holds open: as many as asked for their rate last window. One
     /// left busy alone among idle ones gets all of it once the others have
     /// been quiet for a whole window. One asking past last window's count is
-    /// given a share among all that are open, and only what is unclaimed.
+    /// given a share among all that are open, even with the whole handed out.
     #[test]
     fn a_source_is_shared_among_its_busy_connections() {
         // Ten open, most of them idle throughout.
@@ -1700,8 +1701,8 @@ mod tests {
         assert_eq!(pacers.ask(7, OPEN), 1.0, "the second quiet for a window");
         assert_eq!(
             pacers.ask(7, OPEN),
-            0.0,
-            "a newcomer, with all of it claimed: nothing, for a window"
+            0.1,
+            "a newcomer, with all of it handed out: a tenth, not nothing"
         );
         assert_eq!(pacers.ask(8, OPEN), 0.5, "then halves");
         assert_eq!(pacers.ask(8, OPEN), 0.5);
@@ -1712,17 +1713,49 @@ mod tests {
         );
     }
 
-    /// However many ask in a window, and however few are thought open, the
-    /// shares handed out never add up to more than the whole.
+    /// However many ask in a window, and however few are thought open, none
+    /// is handed nothing, and the shares between them add up to no more than
+    /// `1 + ln n`.
     #[test]
-    fn shares_never_add_up_past_the_whole() {
+    fn shares_are_never_nothing_and_never_add_up_to_much() {
+        const ASKERS: u32 = 12;
+        let bound = 1.0 + (ASKERS as f32).ln();
         for open in [0, 1, 3, 6, 100] {
             let mut pacers = Pacers::default();
             for epoch in [1, 2, 4] {
-                let total: f32 = (0..12).map(|_| pacers.ask(epoch, open)).sum();
-                assert!(total <= 1.0 + 1e-6, "{total} handed out, {open} open");
+                let shares: Vec<f32> = (0..ASKERS).map(|_| pacers.ask(epoch, open)).collect();
+                assert!(
+                    shares.iter().all(|&share| share > 0.0),
+                    "{shares:?} handed out, {open} open"
+                );
+                let total: f32 = shares.iter().sum();
+                assert!(total <= bound, "{total} handed out, {open} open");
             }
         }
+    }
+
+    /// The case that crawled: one connection busy every window, and another
+    /// whose first write in a window comes after it. Shut out for that window,
+    /// the second is paced at the floor, and may hand the kernel a whole
+    /// response at that rate.
+    #[test]
+    fn a_connection_asking_after_a_busy_one_is_not_paced_at_the_floor() {
+        let mut limiter = Addresses::default();
+        limiter.set_bandwidth_limits(100_000_000, 750_000_000);
+        let address = ip(15);
+        let start = Instant::now() + Duration::from_millis(10);
+        limiter.record_bandwidth(address, Direction::Tx, 1, start);
+        let source = limiter.source(address);
+        limiter.entry(source).connections = 2;
+        // The busy one alone, a window.
+        limiter.bandwidth_rate(address, Direction::Tx, WINDOW, 3, start);
+        // Then first again, and the other after it.
+        limiter.bandwidth_rate(address, Direction::Tx, WINDOW, 4, start);
+        let late = limiter
+            .bandwidth_rate(address, Direction::Tx, WINDOW, 4, start)
+            .unwrap()
+            .rate;
+        assert!(late > 1_000_000, "paced at {late}");
     }
 
     /// A browser opening six connections at once, at the defaults: between

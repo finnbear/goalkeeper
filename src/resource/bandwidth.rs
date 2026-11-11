@@ -377,6 +377,29 @@ pub(crate) fn epoch_of(gk: &Goalkeeper) -> u64 {
     gk.bandwidth_epoch.load(Ordering::Relaxed)
 }
 
+/// Registers `cx`'s waker against the end of window `epoch`, returning
+/// whether it did. `false` means that window has already ended, and the caller
+/// should go on rather than wait for a roll that has already happened.
+///
+/// For a caller that has spent what it allows itself per window and parks
+/// until the next, such as a kernel-paced write (see `Applied::configure_tx`).
+pub(crate) fn park_past<P: ProvideGoalkeeper>(
+    conn: &Conn<P>,
+    epoch: u64,
+    cx: &mut Context<'_>,
+) -> bool {
+    let now = Instant::now();
+    conn.provider().limiter.with_process(|_, ledger, _| {
+        let config = ledger.config;
+        ledger.roll(conn.provider(), now, &config);
+        if ledger.epoch != epoch {
+            return false;
+        }
+        ledger.wakers.push(cx.waker().clone());
+        true
+    })
+}
+
 /// The rate the kernel should be told to hold this connection to: what
 /// [`ration`] leaves it, spread over a [`window`], floored so that being
 /// outranked slows a connection rather than stopping it.

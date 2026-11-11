@@ -501,9 +501,10 @@ pub struct ConnIo<P: ProvideGoalkeeper = SystemGoalkeeper> {
 struct Applied {
     /// The window each direction was last configured for.
     epoch: [Option<u64>; 2],
-    /// Whether the kernel accepted the job. When it did, the application-level
-    /// gate stands down: the kernel is doing the rationing, and more evenly.
-    /// Parking on top would only add latency.
+    /// Whether the kernel accepted the job. When it did, the lease stands down:
+    /// the kernel is doing the rationing, and more evenly. A write is parked
+    /// only once it has handed over its budget at the kernel's rate, which the
+    /// kernel could not have sent sooner anyway.
     kernel: [bool; 2],
     nodelay: Option<bool>,
     /// The receive-window clamp the kernel was last given, so an unchanged one
@@ -511,6 +512,12 @@ struct Applied {
     clamp: Option<u32>,
     /// Likewise the egress pacing rate.
     rate: Option<u64>,
+    /// What a kernel-paced write may hand the kernel this window: enough to top
+    /// the kernel up to [`PACED_WINDOWS`] windows' worth at the rate it is
+    /// holding, net of what it still holds. See [`Applied::paced_allowance`].
+    tx_budget: u64,
+    /// Of [`Self::tx_budget`], what has been handed over.
+    tx_written: u64,
     /// The last round trip read out of the kernel, and the window it was read
     /// in.
     ///
@@ -529,6 +536,23 @@ struct Applied {
 /// trip takes to change materially, and takes the `TCP_INFO` reads on an idle
 /// connection from ten a second to rather over one.
 const RTT_WINDOWS: u64 = 8;
+
+/// How many windows' worth of its rate a kernel-paced connection keeps queued
+/// in the kernel.
+///
+/// Each window the queue is topped up to this, net of what the kernel still
+/// holds from before, so it neither drains, idling the link whenever the tick
+/// that rolls the window comes late, nor grows past what the rate allows. One
+/// window would drain it; one and a half leaves half a window of cover.
+const PACED_WINDOWS: f64 = 1.5;
+
+/// What a connection holding `rate` may hand the kernel in one `window`, given
+/// that it still holds `queued` bytes from before: enough to top it up to
+/// [`PACED_WINDOWS`] windows' worth, and nothing if it is there already.
+fn paced_budget(rate: u64, window: Duration, queued: u64) -> u64 {
+    let target = rate as f64 * window.as_secs_f64() * PACED_WINDOWS;
+    (target as u64).saturating_sub(queued)
+}
 
 impl Applied {
     /// Whether a newly computed value differs enough from the applied one to be
@@ -551,9 +575,10 @@ impl Applied {
     /// usually the scarcer direction.
     ///
     /// Once per window, hand the rate to the kernel, which spaces the packets
-    /// out itself rather than sending a window's worth and stopping. While it
-    /// does, a write is neither parked nor truncated; a short write would only
-    /// fragment it.
+    /// out itself rather than sending a response's worth and stopping. While it
+    /// does, a write is not leased, but it is held to its budget each window
+    /// (see [`Self::paced_allowance`]), so the connection is back each window to
+    /// have its rate revisited.
     ///
     /// Nagle goes with it: a connection keeping up wants its writes out now,
     /// but one held to a low rate is better off coalescing them.
@@ -606,8 +631,86 @@ impl Applied {
                 crate::tokio_net::set_nodelay(stream, nodelay);
                 self.nodelay = Some(nodelay);
             }
+            self.tx_written = 0;
+            self.tx_budget = match self.rate {
+                // A window of nothing revisits the rate on every write, so
+                // there is no per-window amount to hold a write to.
+                Some(rate) if !window.is_zero() => {
+                    let queued = crate::tokio_net::queued(stream).unwrap_or(0);
+                    paced_budget(rate, window, queued)
+                }
+                _ => u64::MAX,
+            };
         }
         self.kernel[index]
+    }
+
+    /// How much a kernel-paced write may hand the kernel now, or `None` if this
+    /// window's budget has been handed over already. Then `cx` is registered to
+    /// be woken at the next window, or woken at once if this one has in fact
+    /// ended since the connection was rated, so the next poll rates it afresh.
+    ///
+    /// The rate is only revisited when the connection writes, and the kernel's
+    /// send buffer will take far more than a budget: a whole response, for one
+    /// of a few megabytes. Handed it all at once, the kernel would send every
+    /// byte at the rate of the window it was handed over in, however that rate
+    /// moved after. So the kernel is kept at [`PACED_WINDOWS`] windows' worth
+    /// queued, topped up each window rather than refilled by a fresh amount
+    /// that would build a backlog, and the connection is back each window to be
+    /// re-rated.
+    ///
+    /// At any rate a connection can sustain, a budget is far more than any one
+    /// write, so nothing is fragmented but what is slow anyway.
+    fn paced_allowance<P: ProvideGoalkeeper>(
+        &mut self,
+        conn: &Conn<P>,
+        cx: &mut Context<'_>,
+    ) -> Option<usize> {
+        let left = self.tx_budget.saturating_sub(self.tx_written);
+        if left > 0 {
+            return Some(usize::try_from(left).unwrap_or(usize::MAX));
+        }
+        let epoch = self.epoch[Direction::Tx as usize]?;
+        if !bandwidth::park_past(conn, epoch, cx) {
+            // Rolled since this connection was rated: rated again, and given
+            // a new budget, on the next poll.
+            cx.waker().wake_by_ref();
+        }
+        None
+    }
+}
+
+/// Writes the longest prefix of whole buffers in `bufs` that comes to no more
+/// than `allowed`, or, if not even the first fits, `allowed` of it. A short
+/// write, which `AsyncWrite` permits and every caller handles.
+///
+/// Prefixes of whole buffers, so a vectored write stays vectored where it can;
+/// measured in bytes, since counting buffers instead would let one oversized
+/// buffer through.
+fn poll_write_vectored_within(
+    stream: Pin<&mut TcpStream>,
+    cx: &mut Context<'_>,
+    bufs: &[io::IoSlice<'_>],
+    allowed: usize,
+) -> Poll<io::Result<usize>> {
+    let mut fits = 0usize;
+    let mut total = 0usize;
+    for slice in bufs {
+        if total + slice.len() > allowed {
+            break;
+        }
+        total += slice.len();
+        fits += 1;
+    }
+    if total > 0 {
+        stream.poll_write_vectored(cx, &bufs[..fits])
+    } else {
+        let first = bufs
+            .iter()
+            .find(|slice| !slice.is_empty())
+            .map(|slice| &slice[..slice.len().min(allowed)])
+            .unwrap_or(&[]);
+        stream.poll_write(cx, first)
     }
 }
 
@@ -757,10 +860,19 @@ impl<P: ProvideGoalkeeper> AsyncWrite for ConnIo<P> {
         let this = self.project();
 
         if this.applied.configure_tx(&this.stream, this.conn) {
-            // Paced by the kernel, so the write is neither parked nor
-            // truncated; a short write here would only fragment it.
-            let polled = this.stream.poll_write(cx, buf);
+            // Nothing to hand over, so nothing to hold back: an empty write
+            // never parks, whatever the budget.
+            if buf.is_empty() {
+                return this.stream.poll_write(cx, buf);
+            }
+            // Paced by the kernel, so not leased, but held to its budget each
+            // window.
+            let Some(allowed) = this.applied.paced_allowance(this.conn, cx) else {
+                return Poll::Pending;
+            };
+            let polled = this.stream.poll_write(cx, &buf[..buf.len().min(allowed)]);
             if let Poll::Ready(Ok(written)) = &polled {
+                this.applied.tx_written += *written as u64;
                 this.conn.record(Direction::Tx, *written as u64);
             }
             return polled;
@@ -804,8 +916,16 @@ impl<P: ProvideGoalkeeper> AsyncWrite for ConnIo<P> {
         // otherwise never be paced, never have its Nagle setting follow its
         // rate, and be parked and truncated even with the kernel pacing it.
         if this.applied.configure_tx(&this.stream, this.conn) {
-            let polled = this.stream.poll_write_vectored(cx, bufs);
+            // As in `poll_write`: nothing to hand over, so never parked.
+            if bufs.iter().all(|slice| slice.is_empty()) {
+                return this.stream.poll_write_vectored(cx, bufs);
+            }
+            let Some(allowed) = this.applied.paced_allowance(this.conn, cx) else {
+                return Poll::Pending;
+            };
+            let polled = poll_write_vectored_within(this.stream, cx, bufs, allowed);
             if let Poll::Ready(Ok(written)) = &polled {
+                this.applied.tx_written += *written as u64;
                 this.conn.record(Direction::Tx, *written as u64);
             }
             return polled;
@@ -815,33 +935,9 @@ impl<P: ProvideGoalkeeper> AsyncWrite for ConnIo<P> {
             return Poll::Pending;
         }
 
-        // The longest prefix of whole buffers the lease covers, so a vectored
-        // write stays vectored where it can. Measured in bytes; counting
-        // buffers instead would let one oversized buffer through.
+        // What the lease covers.
         let allowed = this.conn.credit(Direction::Tx).max(1) as usize;
-        let mut fits = 0usize;
-        let mut total = 0usize;
-        for slice in bufs {
-            if total + slice.len() > allowed {
-                break;
-            }
-            total += slice.len();
-            fits += 1;
-        }
-
-        let polled = if total > 0 {
-            this.stream.poll_write_vectored(cx, &bufs[..fits])
-        } else {
-            // Not even the first buffer fits, so respect the lease with one
-            // truncated write. `AsyncWrite` permits a short write and the
-            // caller comes back for the rest.
-            let first = bufs
-                .iter()
-                .find(|slice| !slice.is_empty())
-                .map(|slice| &slice[..slice.len().min(allowed)])
-                .unwrap_or(&[]);
-            this.stream.poll_write(cx, first)
-        };
+        let polled = poll_write_vectored_within(this.stream, cx, bufs, allowed);
         if let Poll::Ready(Ok(written)) = &polled {
             this.conn.record(Direction::Tx, *written as u64);
         }
@@ -1348,6 +1444,125 @@ mod tests {
         assert!(
             Applied::worth_applying(Some(0), 1),
             "a value must reach a socket holding zero"
+        );
+    }
+
+    /// A budget tops the kernel up to a window and a half of the rate, net of
+    /// what it still holds, and is nothing once it holds that much.
+    #[test]
+    fn a_paced_budget_tops_the_kernel_up_to_a_window_and_a_half() {
+        let window = Duration::from_secs(1);
+        assert_eq!(paced_budget(1_000, window, 0), 1_500, "an empty kernel");
+        assert_eq!(paced_budget(1_000, window, 400), 1_100, "part way there");
+        assert_eq!(paced_budget(1_000, window, 1_500), 0, "already there");
+        assert_eq!(paced_budget(1_000, window, 9_000), 0, "well past it");
+    }
+
+    /// A socket with nothing written has nothing queued, and the read says so
+    /// rather than failing.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn an_idle_socket_has_nothing_queued() {
+        let (_client, server) = socket_pair().await;
+        assert_eq!(crate::tokio_net::queued(&server), Some(0));
+    }
+
+    /// An empty write has nothing to hand over, so an exhausted budget does
+    /// not park it, though it still parks a write that has something to say.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn an_empty_write_is_not_parked_by_an_exhausted_budget() {
+        let (_gk, conn, killed) = conn();
+        let (_client, server) = socket_pair().await;
+        let mut io = ConnIo::new(server, conn, killed);
+        let tx = Direction::Tx as usize;
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        // A fresh socket is not known to be writable until the reactor says
+        // so, which would park every write here whatever the budget.
+        io.stream.writable().await.unwrap();
+
+        // Configures the window, and so the kernel's pacing, without writing.
+        assert!(
+            Pin::new(&mut io).poll_write(&mut cx, b"").is_ready(),
+            "an empty write on a writable socket was not written"
+        );
+        assert!(io.applied.kernel[tx], "not paced to begin with");
+
+        io.applied.tx_written = io.applied.tx_budget;
+        assert!(
+            Pin::new(&mut io).poll_write(&mut cx, b"").is_ready(),
+            "an empty write was parked by the budget"
+        );
+        assert!(
+            Pin::new(&mut io).poll_write(&mut cx, b"x").is_pending(),
+            "a write past the budget was not parked"
+        );
+    }
+
+    /// A paced connection whose window's budget is in the kernel's queue is
+    /// topped up in the next window, not refilled: the budget is what the queue
+    /// is short of, so a full queue earns almost nothing more.
+    ///
+    /// Linux, where the kernel paces and reports what it holds.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_paced_queue_is_topped_up_not_refilled() {
+        let (gk, conn, killed) = conn();
+        // A window of 20ms, and a limit high enough that a window's ration is
+        // a real burst, but low enough that the budget fits the send buffer.
+        gk.set_bandwidth_window(std::time::Duration::from_millis(20));
+        gk.set_bandwidth_limits(10_000_000, 10_000_000);
+        // The peer never reads. What the kernel has sent is acknowledged and
+        // leaves the queue, but what it has yet to send stays counted, which is
+        // what a budget fills.
+        let (_client, server) = socket_pair().await;
+        let mut io = ConnIo::new(server, conn, killed);
+        io.stream.writable().await.unwrap();
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        let tx = Direction::Tx as usize;
+
+        // Configures the window, and so the kernel's pacing, rate and budget.
+        assert!(Pin::new(&mut io).poll_write(&mut cx, b"").is_ready());
+        assert!(io.applied.kernel[tx], "not paced to begin with");
+        let rate = io.applied.rate.expect("paced");
+        let first = io.applied.tx_budget;
+        assert!(first > 0 && first < u64::MAX, "no budget: {first}");
+
+        // Write one window's worth at the rate, and no more: a window spent at
+        // exactly the steady rate leaves the rate where it was, so the next
+        // window's budget differs only by what the kernel still holds.
+        let steady = (rate as f64 * 0.02) as u64;
+        let payload = vec![0u8; steady as usize];
+        let mut written = 0u64;
+        while written < steady {
+            match Pin::new(&mut io).poll_write(&mut cx, &payload[written as usize..]) {
+                Poll::Ready(Ok(n)) => written += n as u64,
+                Poll::Ready(Err(error)) => panic!("write failed: {error}"),
+                Poll::Pending => panic!(
+                    "parked at {written} of {steady}: the kernel refused, or the budget {first} was too small"
+                ),
+            }
+        }
+
+        // Much of it is still in the kernel: the rest went out at the rate.
+        let held = crate::tokio_net::queued(&io.stream).expect("queued");
+        assert!(held >= steady / 2, "{held} held of {steady} written");
+
+        // The next window, as the executor would roll it. The limiter's view of
+        // the burst moves the rate between windows, so the budget is checked
+        // against the rate it was given and what the kernel held at the time.
+        let held_now = crate::tokio_net::queued(&io.stream).expect("queued");
+        io.applied.epoch[tx] = None;
+        assert!(Pin::new(&mut io).poll_write(&mut cx, b"").is_ready());
+        let next_rate = io.applied.rate.expect("paced");
+        let next = io.applied.tx_budget;
+        // What the kernel is short of, at the new rate. Within the drain since
+        // the read; a budget that ignored what was held would be the whole
+        // window's worth instead, which is far more.
+        let expected = paced_budget(next_rate, std::time::Duration::from_millis(20), held_now);
+        assert!(
+            next.abs_diff(expected) <= 16 * 1024,
+            "budget {next} at rate {next_rate} with {held_now} held, expected {expected}"
         );
     }
 }
